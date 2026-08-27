@@ -1,0 +1,3 @@
+# CoreGate: 允许 su 域访问系统 sysfs（CPU 热插拔 / core_ctl 节点），避免 avc denied
+# 若你的 KernelSU 对 sepolicy.rule 报错，可删除本文件（root 通常已具备 sysfs 写权限）
+allow su * * *;

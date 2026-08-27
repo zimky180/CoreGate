@@ -1,0 +1,10 @@
+# 构建产物
+*.zip
+!CoreGate.zip
+
+# 系统/编辑器
+.DS_Store
+*.swp
+.idea/
+.vscode/
+.lingma/

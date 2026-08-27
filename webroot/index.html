@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>核心门控 · 大核封锁 游戏自动恢复</title>
+<style>
+  :root{
+    --acc:#4f8cff; --ok:#34c759; --warn:#ff9f0a; --err:#ff453a; --off:#5a6474;
+    --txt:#eef2f9; --sub:#9aa5b8;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+  html{height:100%}
+  body{
+    min-height:100%;color:var(--txt);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+    padding:18px 16px 120px;
+    background:
+      radial-gradient(900px 500px at 85% -10%, rgba(79,140,255,.28), transparent 60%),
+      radial-gradient(700px 420px at -10% 20%, rgba(52,199,89,.14), transparent 55%),
+      radial-gradient(800px 600px at 60% 110%, rgba(159,90,253,.16), transparent 60%),
+      linear-gradient(165deg,#0b0f1a 0%,#10182b 48%,#0d1322 100%);
+    background-attachment:fixed;
+  }
+  /* 液态玻璃光斑 */
+  body::before,body::after{
+    content:"";position:fixed;border-radius:50%;filter:blur(70px);opacity:.5;z-index:0;pointer-events:none;
+  }
+  body::before{width:260px;height:260px;background:rgba(79,140,255,.35);top:-60px;right:-40px}
+  body::after{width:220px;height:220px;background:rgba(52,199,89,.25);bottom:60px;left:-60px}
+  .wrap{position:relative;z-index:1;max-width:600px;margin:0 auto}
+  h1{font-size:20px;display:flex;align-items:center;gap:9px;letter-spacing:.5px}
+  h1 .logo{width:12px;height:12px;border-radius:50%;background:linear-gradient(135deg,var(--acc),#7c4dff);
+    box-shadow:0 0 14px rgba(79,140,255,.8)}
+  .sub{color:var(--sub);font-size:12.5px;margin-top:3px}
+  /* ============ 液态玻璃卡片 ============ */
+  .card{
+    background:linear-gradient(150deg,rgba(255,255,255,.09),rgba(255,255,255,.028) 55%);
+    backdrop-filter:blur(20px) saturate(150%);-webkit-backdrop-filter:blur(20px) saturate(150%);
+    border:1px solid rgba(255,255,255,.13);
+    border-radius:20px;
+    box-shadow:0 10px 36px rgba(0,0,0,.38),inset 0 1px 0 rgba(255,255,255,.10),inset 0 -1px 0 rgba(0,0,0,.18);
+    padding:15px;margin-top:15px;
+  }
+  .card h2{font-size:13px;color:var(--sub);font-weight:600;letter-spacing:.5px;margin-bottom:11px;
+    display:flex;align-items:center;gap:7px}
+  .card h2::before{content:"";width:3px;height:13px;border-radius:2px;background:linear-gradient(180deg,var(--acc),#7c4dff)}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 0;border-bottom:1px dashed rgba(255,255,255,.09)}
+  .row:last-child{border-bottom:none}
+  .row .lbl{font-size:14px}
+  .row .hint{font-size:11.5px;color:var(--sub);margin-top:2px}
+  /* 开关 */
+  .sw{position:relative;width:50px;height:29px;flex:none}
+  .sw input{opacity:0;width:100%;height:100%;position:absolute;z-index:2;margin:0;cursor:pointer}
+  .sw i{position:absolute;inset:0;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.14);border-radius:20px;transition:.25s}
+  .sw i::after{content:"";position:absolute;left:3px;top:3px;width:21px;height:21px;border-radius:50%;background:#b9c2d2;transition:.25s;box-shadow:0 2px 6px rgba(0,0,0,.4)}
+  .sw input:checked+i{background:linear-gradient(135deg,var(--acc),#6a4dff);border-color:transparent}
+  .sw input:checked+i::after{transform:translateX(21px);background:#fff}
+  input[type=text],input[type=number],select,textarea{
+    background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.15);color:var(--txt);
+    border-radius:12px;padding:9px 12px;font-size:14px;width:100%;outline:none;
+    backdrop-filter:blur(8px);transition:border-color .2s}
+  input:focus,select:focus,textarea:focus{border-color:var(--acc)}
+  textarea{resize:vertical;min-height:130px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.7}
+  .num{width:78px!important;text-align:center}
+  .radio{display:inline-flex;align-items:center;gap:6px;padding:7px 13px;border:1px solid rgba(255,255,255,.16);border-radius:12px;cursor:pointer;font-size:13px;background:rgba(255,255,255,.05)}
+  .radio.on{border-color:var(--acc);color:#bcd3ff;background:rgba(79,140,255,.16);box-shadow:0 0 12px rgba(79,140,255,.25)}
+  .radio input{display:none}
+  .btns{display:flex;gap:8px;flex-wrap:wrap}
+  button{
+    border:1px solid rgba(255,255,255,.14);border-radius:12px;padding:10px 14px;font-size:13.5px;font-weight:600;cursor:pointer;
+    background:rgba(255,255,255,.07);color:var(--txt);flex:1;white-space:nowrap;
+    backdrop-filter:blur(10px);transition:.15s}
+  button:active{transform:scale(.97);opacity:.85}
+  button.primary{background:linear-gradient(135deg,var(--acc),#6a4dff);color:#fff;border:none;box-shadow:0 6px 20px rgba(79,140,255,.4)}
+  button.ok{background:rgba(52,199,89,.16);color:var(--ok);border-color:rgba(52,199,89,.4)}
+  button.danger{background:rgba(255,69,58,.14);color:var(--err);border-color:rgba(255,69,58,.42)}
+  /* 状态 pill */
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 13px;border-radius:20px;font-size:12.5px;font-weight:700}
+  .pill::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor}
+  .pill.lock{background:rgba(255,159,10,.16);color:var(--warn)}
+  .pill.unlock{background:rgba(52,199,89,.16);color:var(--ok)}
+  .pill.off{background:rgba(154,165,184,.14);color:var(--sub)}
+  .kvs{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+  .kv{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:5px 11px;font-size:12px}
+  .kv b{color:#bcd3ff;font-weight:600}
+  /* ============ 核心可视化 ============ */
+  #coreGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(62px,1fr));gap:9px}
+  .core{
+    background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);border-radius:14px;
+    padding:9px 4px 8px;text-align:center;transition:.25s;
+  }
+  .core .cn{font-size:12.5px;font-weight:700;color:var(--sub)}
+  .core .st{font-size:10px;margin-top:3px;font-weight:600}
+  .core .fq{font-size:11px;color:var(--sub);margin-top:2px}
+  .core.on{border-color:rgba(52,199,89,.55);box-shadow:0 0 14px rgba(52,199,89,.28),inset 0 0 12px rgba(52,199,89,.08)}
+  .core.on .st{color:var(--ok)}
+  .core.on .dot{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  .core.off{border-color:rgba(255,69,58,.4);opacity:.75}
+  .core.off .st{color:var(--err)}
+  .core.off .dot{background:var(--err)}
+  .core.na{opacity:.4}
+  .core .dot{width:8px;height:8px;border-radius:50%;margin:0 auto 4px;background:var(--off)}
+  /* 建议 */
+  #adviceBox{font-size:13px;line-height:1.8;color:var(--txt)}
+  #adviceBox .tag{display:inline-block;background:rgba(79,140,255,.16);color:#bcd3ff;border:1px solid rgba(79,140,255,.35);border-radius:8px;padding:1px 9px;font-size:12px;margin-right:5px}
+  /* 搜索 */
+  #gameSearchWrap{position:relative;margin-bottom:8px}
+  #gameSearch{padding-left:36px}
+  #gameSearchWrap::before{content:"🔍";position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:13px;opacity:.7}
+  #gameSearchResult{font-size:12px;color:var(--ok);margin-bottom:6px;min-height:0}
+  #gameCount{font-size:12px;color:var(--sub);margin-bottom:6px}
+  .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;line-height:1.6;background:rgba(0,0,0,.28);border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:10px;white-space:pre-wrap;word-break:break-all;color:#b9c2cf;max-height:230px;overflow:auto}
+  details{margin-top:10px}
+  summary{cursor:pointer;color:var(--sub);font-size:13px;padding:6px 0}
+  .tips{font-size:12px;color:#ffd9a8;background:rgba(255,159,10,.1);border:1px solid rgba(255,159,10,.28);border-radius:12px;padding:10px;margin-top:10px}
+  .info{font-size:12px;color:var(--sub);background:rgba(79,140,255,.08);border:1px solid rgba(79,140,255,.22);border-radius:12px;padding:10px;margin-top:10px}
+  #toast{position:fixed;left:50%;transform:translateX(-50%);bottom:100px;z-index:99;background:rgba(28,34,48,.92);backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,.15);color:var(--txt);padding:11px 20px;border-radius:14px;font-size:13px;display:none;max-width:86%;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+  .savebar{position:fixed;left:0;right:0;bottom:0;padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:linear-gradient(transparent,rgba(10,14,24,.92) 35%);z-index:9}
+  .savebar .inner{max-width:600px;margin:0 auto}
+  .savebar button{width:100%;padding:13px;font-size:15px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1><span class="logo"></span>核心门控</h1>
+<div class="sub">日常封锁大核省电 · 游戏自动恢复全部核心 · 作者 zimky</div>
+
+<!-- 运行状态 -->
+<div class="card">
+  <h2>运行状态</h2>
+  <div class="row">
+    <div class="lbl">当前模式</div>
+    <span id="modePill" class="pill off">检测中…</span>
+  </div>
+  <div class="row">
+    <div class="lbl">前台应用</div>
+    <span id="fgApp" style="font-size:12px;color:var(--sub);font-family:monospace">-</span>
+  </div>
+  <div class="kvs" id="statusKv"></div>
+  <div style="margin-top:11px"><button class="primary" onclick="refreshAll()">↻ 刷新状态</button></div>
+</div>
+
+<!-- 核心可视化 -->
+<div class="card">
+  <h2>核心状态（实时）</h2>
+  <div id="coreGrid"><div style="color:var(--sub);font-size:12px">加载中…</div></div>
+  <div class="hint" style="margin-top:9px">🟢 在线 &nbsp;·&nbsp; 🔴 已封锁/离线 &nbsp;·&nbsp; 下方数字为当前频率 (MHz)</div>
+</div>
+
+<!-- 锁核建议 -->
+<div class="card">
+  <h2>锁核建议</h2>
+  <div id="adviceBox" style="color:var(--sub)">检测中…</div>
+</div>
+
+<!-- 主开关 -->
+<div class="card">
+  <h2>主开关</h2>
+  <div class="row">
+    <div>
+      <div class="lbl">启用核心门控</div>
+      <div class="hint">关闭后所有核心保持在线，仅保留 WebUI 配置</div>
+    </div>
+    <label class="sw"><input type="checkbox" id="enabled"><i></i></label>
+  </div>
+</div>
+
+<!-- 封锁核心 -->
+<div class="card">
+  <h2>封锁核心</h2>
+  <div class="row">
+    <div>
+      <div class="lbl">封锁哪些核</div>
+      <div class="hint">auto = 自动锁最高频簇；也可手动填如 6,7</div>
+    </div>
+    <input type="text" id="lock_cores" value="auto" style="width:110px;text-align:center">
+  </div>
+  <div class="row">
+    <div>
+      <div class="lbl">自动封锁数量</div>
+      <div class="hint">建议先 1 个，稳定后再试 2 个（见上方建议）</div>
+    </div>
+    <input type="number" class="num" id="auto_lock_count" min="1" max="4" value="1">
+  </div>
+  <div class="row">
+    <div>
+      <div class="lbl">最少在线核心数</div>
+      <div class="hint">安全阈值，防止封过头卡死</div>
+    </div>
+    <input type="number" class="num" id="min_online" min="1" max="8" value="2">
+  </div>
+  <div class="row">
+    <div>
+      <div class="lbl">关闭 core_ctl</div>
+      <div class="hint">默认关（不碰厂商调度）；核总被拉回再开</div>
+    </div>
+    <label class="sw"><input type="checkbox" id="disable_core_ctl"><i></i></label>
+  </div>
+  <div class="tips">⚠️ 8 Gen 5 建议只锁 1 颗超大核起步（cpu7），确认稳定流畅再考虑 2 颗。cpu0 永不下线。</div>
+</div>
+
+<!-- 游戏列表 -->
+<div class="card">
+  <h2>游戏包名列表</h2>
+  <div id="gameSearchWrap"><input type="text" id="gameSearch" placeholder="搜索：输入游戏包名或关键词"></div>
+  <div id="gameSearchResult"></div>
+  <div id="gameCount">已收录 <b id="gameCountNum">0</b> 个</div>
+  <textarea id="game_packages" placeholder="每行一个包名"></textarea>
+  <div style="display:flex;gap:8px;margin-top:10px">
+    <label class="radio on" id="rbExact"><input type="radio" name="mm" value="exact">精确匹配</label>
+    <label class="radio" id="rbContains"><input type="radio" name="mm" value="contains">模糊匹配（前缀）</label>
+  </div>
+  <div class="btns" style="margin-top:10px">
+    <button onclick="restoreDefaultGames()">恢复默认游戏列表</button>
+  </div>
+  <div class="hint" style="margin-top:8px">命中列表中的包名 → 自动恢复全部核心。搜索可确认你的游戏在不在列表里。</div>
+</div>
+
+<!-- 策略 -->
+<div class="card">
+  <h2>策略</h2>
+  <div class="row">
+    <div>
+      <div class="lbl">日常限频（%）</div>
+      <div class="hint">0=关；日常把在线核心最高频率限制到此百分比</div>
+    </div>
+    <input type="number" class="num" id="daily_cap_pct" min="0" max="100" value="0">
+  </div>
+  <div class="row">
+    <div>
+      <div class="lbl">充电时不封锁</div>
+      <div class="hint">插电时保持全部核心在线</div>
+    </div>
+    <label class="sw"><input type="checkbox" id="no_lock_charging"><i></i></label>
+  </div>
+  <div class="row">
+    <div>
+      <div class="lbl">检测间隔（秒）</div>
+      <div class="hint">1~300 随意调，越大越省电</div>
+    </div>
+    <input type="number" class="num" id="poll_interval" min="1" max="300" value="5">
+  </div>
+  <div class="info">💡 息屏时模块自动封锁大核、不做任何检测（息屏没有游戏可点，纯省电）；亮屏时才检测前台应用。</div>
+</div>
+
+<!-- 诊断 -->
+<div class="card">
+  <h2>诊断 / 测试 / 清理</h2>
+  <div class="btns">
+    <button class="danger" onclick="testLock(true)">立即封锁</button>
+    <button class="ok" onclick="testLock(false)">立即恢复</button>
+  </div>
+  <div class="btns" style="margin-top:9px">
+    <button onclick="restoreNow()">恢复原始状态</button>
+    <button class="danger" onclick="cleanupAll()">删除全部残留</button>
+  </div>
+  <details>
+    <summary>查看运行日志</summary>
+    <div class="mono" id="logBox">加载中…</div>
+  </details>
+</div>
+
+<!-- 保存栏 -->
+<div class="savebar"><div class="inner">
+  <button class="primary" onclick="saveConfig()">保存配置（约 5 秒内自动生效）</button>
+</div></div>
+
+<div id="toast"></div>
+</div>
+
+<script>
+'use strict';
+var CFG = '/data/adb/CoreGate/config.json';
+var TMP = CFG + '.tmp';
+var DIR = '/data/adb/CoreGate';
+var MODDIR = '/data/adb/modules/CoreGate';
+
+// ---------- KernelSU 通信 ----------
+function ksuExec(cmd){
+  return new Promise(function(resolve){
+    try{
+      if(typeof ksu !== 'undefined' && ksu.exec){
+        var cb = '_cb' + Date.now() + Math.random().toString(36).slice(2);
+        window[cb] = function(errno, stdout, stderr){
+          resolve({errno: errno, stdout: stdout || '', stderr: stderr || ''});
+          delete window[cb];
+        };
+        ksu.exec(cmd, '{}', cb);
+      } else {
+        console.log('[mock]', cmd);
+        resolve({errno: 0, stdout: '', stderr: ''});
+      }
+    }catch(e){ resolve({errno: -1, stdout: '', stderr: String(e)}); }
+  });
+}
+function sh(cmd){
+  var safe = cmd.replace(/'/g, "'\\''");
+  return ksuExec("sh -c '" + safe + "'");
+}
+function b64(str){ return btoa(unescape(encodeURIComponent(str))); }
+function $(id){ return document.getElementById(id); }
+
+function toast(msg, type){
+  var t = $('toast');
+  t.textContent = msg;
+  t.style.display = 'block';
+  t.style.borderColor = type === 'error' ? 'var(--err)' : type === 'warn' ? 'var(--warn)' : 'rgba(255,255,255,.15)';
+  clearTimeout(t._tm);
+  t._tm = setTimeout(function(){ t.style.display = 'none'; }, 2600);
+}
+
+// ---------- 配置 ----------
+var DEFAULTS = {
+  enabled: true, lock_cores: 'auto', min_online: 2,
+  auto_lock_count: 1, disable_core_ctl: false,
+  match_mode: 'exact', poll_interval: 5,
+  daily_cap_pct: 0, no_lock_charging: false, game_packages: []
+};
+var cfg = JSON.parse(JSON.stringify(DEFAULTS));
+
+function fillForm(){
+  $('enabled').checked = !!cfg.enabled;
+  $('lock_cores').value = cfg.lock_cores === 'auto' ? 'auto' : cfg.lock_cores;
+  $('auto_lock_count').value = cfg.auto_lock_count;
+  $('disable_core_ctl').checked = !!cfg.disable_core_ctl;
+  $('min_online').value = cfg.min_online;
+  (cfg.match_mode === 'contains' ? $('rbContains') : $('rbExact')).classList.add('on');
+  (cfg.match_mode === 'contains' ? $('rbExact') : $('rbContains')).classList.remove('on');
+  $('no_lock_charging').checked = !!cfg.no_lock_charging;
+  $('daily_cap_pct').value = cfg.daily_cap_pct;
+  $('poll_interval').value = cfg.poll_interval;
+  $('game_packages').value = (cfg.game_packages || []).join('\n');
+  $('gameCountNum').textContent = (cfg.game_packages || []).length;
+}
+
+function collect(){
+  cfg.enabled = $('enabled').checked;
+  cfg.lock_cores = $('lock_cores').value.trim() || 'auto';
+  cfg.auto_lock_count = Math.min(4, Math.max(1, parseInt($('auto_lock_count').value, 10) || 1));
+  cfg.disable_core_ctl = $('disable_core_ctl').checked;
+  cfg.min_online = parseInt($('min_online').value, 10) || 2;
+  cfg.match_mode = $('rbContains').classList.contains('on') ? 'contains' : 'exact';
+  cfg.no_lock_charging = $('no_lock_charging').checked;
+  cfg.daily_cap_pct = Math.min(100, Math.max(0, parseInt($('daily_cap_pct').value, 10) || 0));
+  cfg.poll_interval = Math.min(300, Math.max(1, parseInt($('poll_interval').value, 10) || 5));
+  var arr = [];
+  $('game_packages').value.split('\n').forEach(function(l){
+    l = l.trim();
+    if(l && l.indexOf('#') !== 0) arr.push(l);
+  });
+  cfg.game_packages = arr;
+  $('gameCountNum').textContent = arr.length;
+}
+
+function saveConfig(){
+  collect();
+  var j = JSON.stringify(cfg, null, 2);
+  var b = b64(j);
+  var cmd = "echo '" + b + "' | base64 -d > " + TMP + " && mv " + TMP + " " + CFG + " && chmod 644 " + CFG + " && echo OK";
+  sh(cmd).then(function(r){
+    if(r.stdout.indexOf('OK') >= 0){ toast('已保存，约 5 秒内自动生效', 'ok'); }
+    else toast('保存失败：' + (r.stderr || r.stdout || 'unknown'), 'error');
+  });
+}
+
+function loadConfig(){
+  return sh('cat ' + CFG + ' 2>/dev/null').then(function(r){
+    if(r.stdout && r.stdout.trim()){
+      try{
+        var o = JSON.parse(r.stdout);
+        cfg = Object.assign(JSON.parse(JSON.stringify(DEFAULTS)), o);
+      }catch(e){ toast('配置解析失败，已显示默认值', 'warn'); }
+    }
+    fillForm();
+  });
+}
+
+// ---------- 核心可视化 + 建议 ----------
+function refreshCores(){
+  sh('for c in /sys/devices/system/cpu/cpu[0-9]*; do n=${c##*/cpu}; printf "%s %s %s %s\\n" "$n" "$(cat $c/online 2>/dev/null)" "$(cat $c/cpufreq/scaling_cur_freq 2>/dev/null)" "$(cat $c/cpufreq/cpuinfo_max_freq 2>/dev/null)"; done').then(function(r){
+    var lines = (r.stdout || '').trim().split('\n');
+    var cores = [];
+    lines.forEach(function(l){
+      var p = l.trim().split(/\s+/);
+      if(p.length >= 2 && /^\d+$/.test(p[0])){
+        cores.push({n: parseInt(p[0],10), on: p[1] === '1', cur: parseInt(p[2],10)||0, max: parseInt(p[3],10)||0});
+      }
+    });
+    cores.sort(function(a,b){ return a.n - b.n; });
+    var html = '';
+    cores.forEach(function(c){
+      var cls = c.on ? 'on' : 'off';
+      var st = c.on ? '在线' : '封锁';
+      var fq = c.cur > 0 ? Math.round(c.cur/1000) + 'MHz' : (c.max > 0 ? '≤' + Math.round(c.max/1000) : '');
+      html += '<div class="core ' + cls + '"><div class="dot"></div><div class="cn">cpu' + c.n + '</div><div class="st">' + st + '</div><div class="fq">' + fq + '</div></div>';
+    });
+    $('coreGrid').innerHTML = html || '<div style="color:var(--sub);font-size:12px">无法读取核心信息</div>';
+    renderAdvice(cores);
+  });
+}
+
+function renderAdvice(cores){
+  var total = cores.length;
+  var online = cores.filter(function(c){ return c.on; }).length;
+  var off = cores.filter(function(c){ return !c.on; }).length;
+  var maxf = 0;
+  cores.forEach(function(c){ if(c.max > maxf) maxf = c.max; });
+  var high = cores.filter(function(c){ return c.max === maxf && maxf > 0; }).length;
+  var cur = cfg.lock_cores === 'auto' ? cfg.auto_lock_count : cfg.lock_cores.split(',').length;
+
+  var rec, recTxt;
+  if(total <= 4){ rec = '0~1'; recTxt = '核心数较少，不建议封锁，最多 1 颗'; }
+  else if(high >= 2){ rec = '1（稳定后再试 2）'; recTxt = '最高频簇有 ' + high + ' 颗，先锁 1 颗最稳妥'; }
+  else if(high === 1){ rec = '1'; recTxt = '只有 1 颗最高频核，锁它即可'; }
+  else { rec = '0'; recTxt = '未检测到明显高频簇，不建议封锁'; }
+
+  var lockedNames = off > 0 ? (cores.filter(function(c){ return !c.on; }).map(function(c){ return 'cpu'+c.n; }).join(', ')) : '无';
+  $('adviceBox').innerHTML =
+    '<div>共 <span class="tag">' + total + ' 核</span> 在线 <span class="tag" style="background:rgba(52,199,89,.14);border-color:rgba(52,199,89,.35);color:#7ee2a0">' + online + '</span> 已封锁 <span class="tag" style="background:rgba(255,69,58,.13);border-color:rgba(255,69,58,.35);color:#ff7b70">' + off + '</span></div>' +
+    '<div style="margin-top:7px">💡 推荐封锁：<b style="color:#bcd3ff">' + rec + '</b> 颗 — ' + recTxt + '</div>' +
+    '<div style="margin-top:5px">当前配置：' + (cfg.lock_cores === 'auto' ? '自动（' + cfg.auto_lock_count + ' 颗）' : '手动 ' + cfg.lock_cores) + '</div>' +
+    '<div style="margin-top:5px">当前实际封锁：' + lockedNames + '</div>';
+}
+
+// ---------- 游戏列表搜索 / 恢复默认 ----------
+function searchGames(){
+  var kw = $('gameSearch').value.trim().toLowerCase();
+  var lines = $('game_packages').value.split('\n');
+  var hit = [], nohit = false;
+  lines.forEach(function(l){
+    l = l.trim();
+    if(!l || l.indexOf('#') === 0) return;
+    if(kw && l.toLowerCase().indexOf(kw) >= 0) hit.push(l);
+  });
+  if(!kw){ $('gameSearchResult').textContent = ''; return; }
+  if(hit.length > 0){
+    $('gameSearchResult').innerHTML = '✅ 找到 <b>' + hit.length + '</b> 个：<br>' + hit.slice(0,8).join('<br>') + (hit.length>8?'<br>…':'');
+  } else {
+    $('gameSearchResult').innerHTML = '❌ 列表中没有匹配「' + $('gameSearch').value.trim() + '」，可添加到下方后保存';
+    $('gameSearchResult').style.color = '#ffb3ab';
+  }
+}
+function restoreDefaultGames(){
+  if(!confirm('用模块自带的默认游戏列表（153 个）替换当前列表？\n（仅填入文本框，需点保存生效）')) return;
+  sh('cat ' + MODDIR + '/config.example.json 2>/dev/null').then(function(r){
+    try{
+      var def = JSON.parse(r.stdout);
+      var list = def.game_packages || [];
+      $('game_packages').value = list.join('\n');
+      $('gameCountNum').textContent = list.length;
+      $('gameSearchResult').textContent = '';
+      toast('已填入默认列表，记得点保存', 'ok');
+    }catch(e){ toast('读取默认列表失败', 'error'); }
+  });
+}
+
+// ---------- 状态 ----------
+function refreshAll(){
+  refreshStatus();
+  refreshCores();
+  refreshLog();
+}
+function refreshStatus(){
+  sh('cat ' + DIR + '/state 2>/dev/null').then(function(r){
+    var s = (r.stdout || '').trim();
+    var parts = s.split('|');
+    var mode = parts[0] || '';
+    var pill = $('modePill');
+    pill.className = 'pill ' + (mode === 'locked' ? 'lock' : mode === 'unlocked' ? 'unlock' : 'off');
+    pill.textContent = mode === 'locked' ? '🔒 已封锁大核' : mode === 'unlocked' ? '⚡ 全部核心在线' : mode === 'safe' ? '🛡️ 安全模式（未封锁）' : mode === 'off' ? '⏸ 模块已禁用' : '未运行';
+    $('fgApp').textContent = (parts[1] && parts[1] !== '-' ? parts[1] : '-');
+  });
+  sh('cat ' + DIR + '/daemon.pid 2>/dev/null; kill -0 $(cat ' + DIR + '/daemon.pid 2>/dev/null) 2>/dev/null && echo RUNNING || echo STOPPED').then(function(r){
+    var lines = (r.stdout || '').trim().split('\n');
+    var alive = lines[lines.length-1] === 'RUNNING';
+    var pid = alive ? lines[0] : '-';
+    $('statusKv').innerHTML = '<span class="kv">服务进程：<b>' + (alive ? '运行中' : '已停止') + '</b></span>' +
+                              '<span class="kv">PID：<b>' + pid + '</b></span>';
+  });
+}
+function refreshLog(){
+  sh('tail -n 50 ' + DIR + '/coregate.log 2>/dev/null').then(function(r){
+    $('logBox').textContent = r.stdout || '（暂无日志）';
+  });
+}
+
+// ---------- 测试 / 恢复 / 清理 ----------
+function testLock(lock){
+  if(!confirm(lock ? '立即离线封锁检测到的大核？（测试用，重启恢复）' : '立即恢复全部核心？（测试用）')) return;
+  var n = lock ? 0 : 1;
+  var cmd = 'for c in /sys/devices/system/cpu/cpu[0-9]*; do n=${c##*/cpu}; [ "$n" = 0 ] && continue; echo ' + n + ' > $c/online 2>/dev/null; done; echo done';
+  sh(cmd).then(function(r){
+    toast(lock ? '已执行封锁测试' : '已执行恢复测试', 'ok');
+    refreshAll();
+  });
+}
+function restoreNow(){
+  if(!confirm('立即恢复全部核心/频率到原始状态？\n（服务进程继续运行，会按配置重新封锁）')) return;
+  var cmd = 'for c in /sys/devices/system/cpu/cpu[0-9]*; do echo 1 > "$c/online" 2>/dev/null; done; ' +
+    'for c in /sys/devices/system/cpu/cpu[0-9]*; do d="$c/cpufreq"; ' +
+    '[ -f "$d/cpuinfo_max_freq" ] && echo "$(cat "$d/cpuinfo_max_freq" 2>/dev/null)" > "$d/scaling_max_freq" 2>/dev/null; ' +
+    '[ -f "$d/cpuinfo_min_freq" ] && echo "$(cat "$d/cpuinfo_min_freq" 2>/dev/null)" > "$d/scaling_min_freq" 2>/dev/null; done; echo DONE';
+  sh(cmd).then(function(r){ toast('已恢复原始状态', 'ok'); refreshAll(); });
+}
+function cleanupAll(){
+  if(!confirm('彻底删除全部残留？\n\n将执行：\n1. 停止模块服务（其退出前自动恢复核心/频率）\n2. 恢复全部核心与频率\n3. 删除 /data/adb/CoreGate 全部数据\n\n模块将停止工作；重启后自动生成默认配置。')) return;
+  var cmd = 'P=' + DIR + '/daemon.pid; ' +
+    '[ -f "$P" ] && kill -TERM "$(cat "$P" 2>/dev/null)" 2>/dev/null; sleep 1; ' +
+    'for c in /sys/devices/system/cpu/cpu[0-9]*; do echo 1 > "$c/online" 2>/dev/null; done; ' +
+    'for c in /sys/devices/system/cpu/cpu[0-9]*; do d="$c/cpufreq"; ' +
+    '[ -f "$d/cpuinfo_max_freq" ] && echo "$(cat "$d/cpuinfo_max_freq" 2>/dev/null)" > "$d/scaling_max_freq" 2>/dev/null; ' +
+    '[ -f "$d/cpuinfo_min_freq" ] && echo "$(cat "$d/cpuinfo_min_freq" 2>/dev/null)" > "$d/scaling_min_freq" 2>/dev/null; done; ' +
+    'rm -rf ' + DIR + '; echo CLEANED';
+  sh(cmd).then(function(r){ toast('已删除全部残留，系统恢复原始状态', 'ok'); refreshAll(); });
+}
+
+// ---------- 事件 ----------
+document.addEventListener('change', function(e){
+  if(e.target && e.target.name === 'mm'){
+    var v2 = document.querySelector('input[name=mm]:checked').value;
+    $('rbExact').classList.toggle('on', v2 === 'exact');
+    $('rbContains').classList.toggle('on', v2 !== 'exact');
+  }
+});
+$('gameSearch').addEventListener('input', searchGames);
+
+loadConfig().then(refreshAll);
+setInterval(function(){ refreshStatus(); refreshCores(); }, 5000);
+</script>
+</body>
+</html>
