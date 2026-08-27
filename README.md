@@ -23,7 +23,7 @@
 
 ## 安装
 
-1. 刷入 `核心门控.zip`（KernelSU 管理器 → 模块 → 本地安装；GitHub Releases 下载）
+1. 下载 GitHub Releases 附件 `CoreGate.zip`（GitHub 附件名仅支持英文；模块名/界面均为「核心门控」）→ KernelSU 管理器 → 模块 → 本地安装
 2. 重启
 3. KernelSU 管理器 → 模块 → 打开 CoreGate 的 WebUI
 4. 添加你的游戏包名 → 保存（约 2 秒内自动生效，无需重启）
