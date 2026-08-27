@@ -61,7 +61,7 @@
     border-radius:12px;padding:9px 12px;font-size:14px;width:100%;outline:none;
     backdrop-filter:blur(8px);transition:border-color .2s}
   input:focus,select:focus,textarea:focus{border-color:var(--acc)}
-  textarea{resize:vertical;min-height:130px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.7}
+  textarea{resize:vertical;min-height:190px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;line-height:1.7}
   .num{width:78px!important;text-align:center}
   .radio{display:inline-flex;align-items:center;gap:6px;padding:7px 13px;border:1px solid rgba(255,255,255,.16);border-radius:12px;cursor:pointer;font-size:13px;background:rgba(255,255,255,.05)}
   .radio.on{border-color:var(--acc);color:#bcd3ff;background:rgba(79,140,255,.16);box-shadow:0 0 12px rgba(79,140,255,.25)}
@@ -101,15 +101,17 @@
   .core.off .dot{background:var(--err)}
   .core.na{opacity:.4}
   .core .dot{width:8px;height:8px;border-radius:50%;margin:0 auto 4px;background:var(--off)}
+  .core.clickable{cursor:pointer}
+  .core.clickable:active{transform:scale(.94)}
+  .core.na .st{color:var(--sub)}
   /* 建议 */
   #adviceBox{font-size:13px;line-height:1.8;color:var(--txt)}
   #adviceBox .tag{display:inline-block;background:rgba(79,140,255,.16);color:#bcd3ff;border:1px solid rgba(79,140,255,.35);border-radius:8px;padding:1px 9px;font-size:12px;margin-right:5px}
-  /* 搜索 */
-  #gameSearchWrap{position:relative;margin-bottom:8px}
-  #gameSearch{padding-left:36px}
-  #gameSearchWrap::before{content:"🔍";position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:13px;opacity:.7}
-  #gameSearchResult{font-size:12px;color:var(--ok);margin-bottom:6px;min-height:0}
   #gameCount{font-size:12px;color:var(--sub);margin-bottom:6px}
+  #gameSearchWrap{position:relative;margin-bottom:8px}
+  #gameSearch{padding-left:34px}
+  #gameSearchWrap::before{content:"🔍";position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:13px;opacity:.7}
+  #gameSearchResult{font-size:12px;min-height:0;margin-bottom:6px;word-break:break-all;line-height:1.7}
   .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;line-height:1.6;background:rgba(0,0,0,.28);border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:10px;white-space:pre-wrap;word-break:break-all;color:#b9c2cf;max-height:230px;overflow:auto}
   details{margin-top:10px}
   summary{cursor:pointer;color:var(--sub);font-size:13px;padding:6px 0}
@@ -146,7 +148,7 @@
 <div class="card">
   <h2>核心状态（实时）</h2>
   <div id="coreGrid"><div style="color:var(--sub);font-size:12px">加载中…</div></div>
-  <div class="hint" style="margin-top:9px">🟢 在线 &nbsp;·&nbsp; 🔴 已封锁/离线 &nbsp;·&nbsp; 下方数字为当前频率 (MHz)</div>
+  <div class="hint" style="margin-top:9px">🟢 在线 · 🔴 已封锁 · 数字=当前频率 (MHz) · <b>点击卡片即可封锁/恢复该核</b>（cpu0 系统保留）</div>
 </div>
 
 <!-- 锁核建议 -->
@@ -204,18 +206,11 @@
 <!-- 游戏列表 -->
 <div class="card">
   <h2>游戏包名列表</h2>
-  <div id="gameSearchWrap"><input type="text" id="gameSearch" placeholder="搜索：输入游戏包名或关键词"></div>
+  <div id="gameSearchWrap"><input type="text" id="gameSearch" placeholder="搜索包名，如 com.tencent.tmgp.sgame"></div>
   <div id="gameSearchResult"></div>
-  <div id="gameCount">已收录 <b id="gameCountNum">0</b> 个</div>
-  <textarea id="game_packages" placeholder="每行一个包名"></textarea>
-  <div style="display:flex;gap:8px;margin-top:10px">
-    <label class="radio on" id="rbExact"><input type="radio" name="mm" value="exact">精确匹配</label>
-    <label class="radio" id="rbContains"><input type="radio" name="mm" value="contains">模糊匹配（前缀）</label>
-  </div>
-  <div class="btns" style="margin-top:10px">
-    <button onclick="restoreDefaultGames()">恢复默认游戏列表</button>
-  </div>
-  <div class="hint" style="margin-top:8px">命中列表中的包名 → 自动恢复全部核心。搜索可确认你的游戏在不在列表里。</div>
+  <div id="gameCount">已收录 <b id="gameCountNum">0</b> 个包名</div>
+  <textarea id="game_packages" placeholder="每行一个包名，换行添加&#10;如：com.miHoYo.Yuanshen&#10;com.tencent.tmgp.sgame"></textarea>
+  <div class="hint" style="margin-top:8px">添加游戏：换行输入包名 → 点「保存配置」生效。命中列表 → 自动恢复全部核心。</div>
 </div>
 
 <!-- 策略 -->
@@ -275,7 +270,8 @@
 var CFG = '/data/adb/CoreGate/config.json';
 var TMP = CFG + '.tmp';
 var DIR = '/data/adb/CoreGate';
-var MODDIR = '/data/adb/modules/CoreGate';
+var PACKAGES = DIR + '/packages.txt';
+var PACKAGES_TMP = PACKAGES + '.tmp';
 
 // ---------- KernelSU 通信 ----------
 function ksuExec(cmd){
@@ -315,24 +311,28 @@ function toast(msg, type){
 var DEFAULTS = {
   enabled: true, lock_cores: 'auto', min_online: 2,
   auto_lock_count: 1, disable_core_ctl: false,
-  match_mode: 'exact', poll_interval: 5,
-  daily_cap_pct: 0, no_lock_charging: false, game_packages: []
+  poll_interval: 5,
+  daily_cap_pct: 0, no_lock_charging: false
 };
 var cfg = JSON.parse(JSON.stringify(DEFAULTS));
 
+function updateGameCount(){
+  var n = 0;
+  $('game_packages').value.split('\n').forEach(function(l){
+    l = l.trim();
+    if(l && l.indexOf('#') !== 0) n++;
+  });
+  $('gameCountNum').textContent = n;
+}
 function fillForm(){
   $('enabled').checked = !!cfg.enabled;
   $('lock_cores').value = cfg.lock_cores === 'auto' ? 'auto' : cfg.lock_cores;
   $('auto_lock_count').value = cfg.auto_lock_count;
   $('disable_core_ctl').checked = !!cfg.disable_core_ctl;
   $('min_online').value = cfg.min_online;
-  (cfg.match_mode === 'contains' ? $('rbContains') : $('rbExact')).classList.add('on');
-  (cfg.match_mode === 'contains' ? $('rbExact') : $('rbContains')).classList.remove('on');
   $('no_lock_charging').checked = !!cfg.no_lock_charging;
   $('daily_cap_pct').value = cfg.daily_cap_pct;
   $('poll_interval').value = cfg.poll_interval;
-  $('game_packages').value = (cfg.game_packages || []).join('\n');
-  $('gameCountNum').textContent = (cfg.game_packages || []).length;
 }
 
 function collect(){
@@ -341,43 +341,60 @@ function collect(){
   cfg.auto_lock_count = Math.min(4, Math.max(1, parseInt($('auto_lock_count').value, 10) || 1));
   cfg.disable_core_ctl = $('disable_core_ctl').checked;
   cfg.min_online = parseInt($('min_online').value, 10) || 2;
-  cfg.match_mode = $('rbContains').classList.contains('on') ? 'contains' : 'exact';
   cfg.no_lock_charging = $('no_lock_charging').checked;
   cfg.daily_cap_pct = Math.min(100, Math.max(0, parseInt($('daily_cap_pct').value, 10) || 0));
   cfg.poll_interval = Math.min(300, Math.max(1, parseInt($('poll_interval').value, 10) || 5));
-  var arr = [];
-  $('game_packages').value.split('\n').forEach(function(l){
-    l = l.trim();
-    if(l && l.indexOf('#') !== 0) arr.push(l);
-  });
-  cfg.game_packages = arr;
-  $('gameCountNum').textContent = arr.length;
+  updateGameCount();
 }
 
 function saveConfig(){
   collect();
-  var j = JSON.stringify(cfg, null, 2);
-  var b = b64(j);
-  var cmd = "echo '" + b + "' | base64 -d > " + TMP + " && mv " + TMP + " " + CFG + " && chmod 644 " + CFG + " && echo OK";
+  delete cfg.game_packages;
+  delete cfg.match_mode;
+  var b  = b64(JSON.stringify(cfg, null, 2));
+  var bp = b64($('game_packages').value.replace(/\r/g, ''));
+  var cmd = "echo '" + b + "' | base64 -d > " + TMP + " && mv " + TMP + " " + CFG + " && chmod 644 " + CFG + " && " +
+            "echo '" + bp + "' | base64 -d > " + PACKAGES_TMP + " && mv " + PACKAGES_TMP + " " + PACKAGES + " && chmod 644 " + PACKAGES + " && echo OK";
   sh(cmd).then(function(r){
-    if(r.stdout.indexOf('OK') >= 0){ toast('已保存，约 5 秒内自动生效', 'ok'); }
+    if(r.stdout.indexOf('OK') >= 0){ toast('已保存，约 5 秒内自动生效', 'ok'); loadPackages(); }
     else toast('保存失败：' + (r.stderr || r.stdout || 'unknown'), 'error');
   });
 }
 
+// 读取配置（config.json 很小，直接整读解析；若还带旧版大数组则剥离后重试）
 function loadConfig(){
   return sh('cat ' + CFG + ' 2>/dev/null').then(function(r){
-    if(r.stdout && r.stdout.trim()){
-      try{
-        var o = JSON.parse(r.stdout);
-        cfg = Object.assign(JSON.parse(JSON.stringify(DEFAULTS)), o);
-      }catch(e){ toast('配置解析失败，已显示默认值', 'warn'); }
+    var txt = (r.stdout || '').trim();
+    var o = null;
+    if(txt){ try{ o = JSON.parse(txt); }catch(e){ o = null; } }
+    if(!o && txt.indexOf('game_packages') >= 0){
+      // 旧版大配置：剥离 game_packages 数组后重试（service.sh 启动时也会自动瘦身）
+      return sh("sed -n '1,/\"game_packages\"/p' " + CFG + " 2>/dev/null | sed '$d' | sed '$s/,$//'").then(function(r2){
+        var head = (r2.stdout || '').trim();
+        try{ o = JSON.parse(head + '\n}'); }catch(e){ o = null; }
+        if(o) cfg = Object.assign(JSON.parse(JSON.stringify(DEFAULTS)), o);
+        else toast('配置解析失败，已显示默认值', 'warn');
+        fillForm();
+        return loadPackages();
+      });
     }
+    if(o) cfg = Object.assign(JSON.parse(JSON.stringify(DEFAULTS)), o);
+    else toast('配置解析失败，已显示默认值', 'warn');
     fillForm();
+    return loadPackages();
+  });
+}
+
+// 读取游戏包名列表：独立纯文本文件，每行一个（与晨夕敛光同款，绝无解析问题）
+function loadPackages(){
+  return sh('cat ' + PACKAGES + ' 2>/dev/null').then(function(r){
+    $('game_packages').value = r.stdout || '';
+    updateGameCount();
   });
 }
 
 // ---------- 核心可视化 + 建议 ----------
+var lastCores = [];
 function refreshCores(){
   sh('for c in /sys/devices/system/cpu/cpu[0-9]*; do n=${c##*/cpu}; printf "%s %s %s %s\\n" "$n" "$(cat $c/online 2>/dev/null)" "$(cat $c/cpufreq/scaling_cur_freq 2>/dev/null)" "$(cat $c/cpufreq/cpuinfo_max_freq 2>/dev/null)"; done').then(function(r){
     var lines = (r.stdout || '').trim().split('\n');
@@ -389,16 +406,64 @@ function refreshCores(){
       }
     });
     cores.sort(function(a,b){ return a.n - b.n; });
+    lastCores = cores;
     var html = '';
     cores.forEach(function(c){
+      if(c.n === 0){
+        // cpu0 系统保留：不给开关
+        html += '<div class="core na"><div class="dot"></div><div class="cn">cpu0</div><div class="st">系统保留</div><div class="fq">' + (c.cur>0?Math.round(c.cur/1000)+'MHz':'') + '</div></div>';
+        return;
+      }
       var cls = c.on ? 'on' : 'off';
       var st = c.on ? '在线' : '封锁';
       var fq = c.cur > 0 ? Math.round(c.cur/1000) + 'MHz' : (c.max > 0 ? '≤' + Math.round(c.max/1000) : '');
-      html += '<div class="core ' + cls + '"><div class="dot"></div><div class="cn">cpu' + c.n + '</div><div class="st">' + st + '</div><div class="fq">' + fq + '</div></div>';
+      html += '<div class="core clickable ' + cls + '" onclick="toggleCore(' + c.n + ')"><div class="dot"></div><div class="cn">cpu' + c.n + '</div><div class="st">' + st + '</div><div class="fq">' + fq + '</div></div>';
     });
     $('coreGrid').innerHTML = html || '<div style="color:var(--sub);font-size:12px">无法读取核心信息</div>';
     renderAdvice(cores);
   });
+}
+
+// 点击核心开关：立即生效 + 同步写入配置
+function toggleCore(n){
+  if(n === 0){ toast('cpu0 是系统保留核心，不可封锁', 'warn'); return; }
+  var core = null;
+  lastCores.forEach(function(c){ if(c.n === n) core = c; });
+  if(!core) return;
+  var minOnline = parseInt($('min_online').value, 10) || 2;
+  var onlineNow = lastCores.filter(function(c){ return c.on; }).length;
+  if(core.on){
+    // 要封锁
+    if(onlineNow - 1 < minOnline){ toast('封锁后在线核心将少于安全值 ' + minOnline + '，已拒绝', 'warn'); return; }
+    if(!confirm('封锁 cpu' + n + '？\n（立即生效，并写入「封锁核心」配置）')) return;
+    sh('echo 0 > /sys/devices/system/cpu/cpu' + n + '/online 2>/dev/null; cat /sys/devices/system/cpu/cpu' + n + '/online 2>/dev/null').then(function(r){
+      if((r.stdout || '').trim() === '0'){ toast('cpu' + n + ' 已封锁', 'ok'); updateLockList(n, true); }
+      else toast('封锁 cpu' + n + ' 失败（内核可能拒绝，请查看日志）', 'error');
+      refreshCores();
+    });
+  } else {
+    if(!confirm('恢复 cpu' + n + '？\n（立即生效，并写入「封锁核心」配置）')) return;
+    sh('echo 1 > /sys/devices/system/cpu/cpu' + n + '/online 2>/dev/null; cat /sys/devices/system/cpu/cpu' + n + '/online 2>/dev/null').then(function(r){
+      if((r.stdout || '').trim() === '1'){ toast('cpu' + n + ' 已恢复', 'ok'); updateLockList(n, false); }
+      else toast('恢复 cpu' + n + ' 失败', 'error');
+      refreshCores();
+    });
+  }
+}
+
+// 同步锁定列表：把 n 加入/移出 → 转为手动列表（或 auto）→ 保存
+function updateLockList(n, locked){
+  var offline = lastCores.filter(function(c){ return !c.on && c.n !== 0; }).map(function(c){ return c.n; });
+  var list = offline.slice();
+  var idx = list.indexOf(n);
+  if(locked && idx < 0) list.push(n);
+  if(!locked && idx >= 0) list.splice(idx, 1);
+  list.sort(function(a,b){ return a-b; });
+  cfg.lock_cores = list.length ? list.join(',') : 'auto';
+  $('lock_cores').value = cfg.lock_cores;
+  collect();
+  saveConfig();
+  toast(locked ? ('cpu' + n + ' 已加入封锁列表') : ('cpu' + n + ' 已移出封锁列表'), 'ok');
 }
 
 function renderAdvice(cores){
@@ -424,36 +489,24 @@ function renderAdvice(cores){
     '<div style="margin-top:5px">当前实际封锁：' + lockedNames + '</div>';
 }
 
-// ---------- 游戏列表搜索 / 恢复默认 ----------
+// 搜索游戏包名：实时从输入框内容过滤，确认是否在列表
 function searchGames(){
   var kw = $('gameSearch').value.trim().toLowerCase();
-  var lines = $('game_packages').value.split('\n');
-  var hit = [], nohit = false;
-  lines.forEach(function(l){
+  var hit = [];
+  $('game_packages').value.split('\n').forEach(function(l){
     l = l.trim();
     if(!l || l.indexOf('#') === 0) return;
     if(kw && l.toLowerCase().indexOf(kw) >= 0) hit.push(l);
   });
-  if(!kw){ $('gameSearchResult').textContent = ''; return; }
+  var el = $('gameSearchResult');
+  if(!kw){ el.textContent = ''; return; }
   if(hit.length > 0){
-    $('gameSearchResult').innerHTML = '✅ 找到 <b>' + hit.length + '</b> 个：<br>' + hit.slice(0,8).join('<br>') + (hit.length>8?'<br>…':'');
+    el.innerHTML = '✅ 在列表中：找到 <b>' + hit.length + '</b> 个<br>' + hit.slice(0,10).join('<br>') + (hit.length > 10 ? '<br>…' : '');
+    el.style.color = '#7ee2a0';
   } else {
-    $('gameSearchResult').innerHTML = '❌ 列表中没有匹配「' + $('gameSearch').value.trim() + '」，可添加到下方后保存';
-    $('gameSearchResult').style.color = '#ffb3ab';
+    el.innerHTML = '❌ 列表中没有「' + $('gameSearch').value.trim() + '」<br>可在下方输入框换行添加后点「保存配置」';
+    el.style.color = '#ffb3ab';
   }
-}
-function restoreDefaultGames(){
-  if(!confirm('用模块自带的默认游戏列表（153 个）替换当前列表？\n（仅填入文本框，需点保存生效）')) return;
-  sh('cat ' + MODDIR + '/config.example.json 2>/dev/null').then(function(r){
-    try{
-      var def = JSON.parse(r.stdout);
-      var list = def.game_packages || [];
-      $('game_packages').value = list.join('\n');
-      $('gameCountNum').textContent = list.length;
-      $('gameSearchResult').textContent = '';
-      toast('已填入默认列表，记得点保存', 'ok');
-    }catch(e){ toast('读取默认列表失败', 'error'); }
-  });
 }
 
 // ---------- 状态 ----------
@@ -518,12 +571,9 @@ function cleanupAll(){
 
 // ---------- 事件 ----------
 document.addEventListener('change', function(e){
-  if(e.target && e.target.name === 'mm'){
-    var v2 = document.querySelector('input[name=mm]:checked').value;
-    $('rbExact').classList.toggle('on', v2 === 'exact');
-    $('rbContains').classList.toggle('on', v2 !== 'exact');
-  }
+  // 预留
 });
+$('game_packages').addEventListener('input', updateGameCount);
 $('gameSearch').addEventListener('input', searchGames);
 
 loadConfig().then(refreshAll);

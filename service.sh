@@ -17,6 +17,7 @@ MODDIR=${0%/*}
 MODULE_ID=$(basename "$MODDIR")
 CONFIG_DIR="/data/adb/CoreGate"
 CONFIG_FILE="$CONFIG_DIR/config.json"
+PACKAGES_FILE="$CONFIG_DIR/packages.txt"
 LOG_FILE="$CONFIG_DIR/coregate.log"
 STATE_FILE="$CONFIG_DIR/state"
 PID_FILE="$CONFIG_DIR/daemon.pid"
@@ -28,6 +29,27 @@ echo $$ > "$PID_FILE" 2>/dev/null
 if [ ! -f "$CONFIG_FILE" ] && [ -f "$MODDIR/config.example.json" ]; then
     cp -f "$MODDIR/config.example.json" "$CONFIG_FILE" 2>/dev/null
     chmod 0644 "$CONFIG_FILE" 2>/dev/null
+fi
+# 包名列表缺失时兜底：优先从旧 config.json 迁移，否则用模块自带默认列表
+if [ ! -f "$PACKAGES_FILE" ]; then
+    if [ -f "$CONFIG_FILE" ] && grep -q '"game_packages"' "$CONFIG_FILE" 2>/dev/null; then
+        # 旧版迁移：从 config.json 的 game_packages 数组提取包名
+        sed -n '/"game_packages"/,/]/p' "$CONFIG_FILE" 2>/dev/null \
+            | grep -oE '"[^"]+"' | tr -d '"' | grep -v '^game_packages$' > "$PACKAGES_FILE"
+    fi
+    if [ ! -s "$PACKAGES_FILE" ] && [ -f "$MODDIR/packages.txt" ]; then
+        cp -f "$MODDIR/packages.txt" "$PACKAGES_FILE" 2>/dev/null
+    fi
+    chmod 0644 "$PACKAGES_FILE" 2>/dev/null
+fi
+# 旧版 config.json 若还带 game_packages 大数组 → 剥离瘦身（包名已迁到 packages.txt），
+# 保持 config.json 为小文件，WebUI 可整读解析不截断
+if [ -f "$CONFIG_FILE" ] && grep -q '"game_packages"' "$CONFIG_FILE" 2>/dev/null; then
+    sed -n '1,/"game_packages"/p' "$CONFIG_FILE" 2>/dev/null | sed '$d' | sed '$s/,$//' > "$CONFIG_FILE.tmp" 2>/dev/null
+    echo '}' >> "$CONFIG_FILE.tmp"
+    [ -s "$CONFIG_FILE.tmp" ] && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE" && chmod 0644 "$CONFIG_FILE"
+    rm -f "$CONFIG_FILE.tmp"
+    log "已剥离旧版 game_packages 数组，config.json 已瘦身"
 fi
 
 # ---------------- 日志 ----------------
@@ -55,11 +77,6 @@ cfg_int() {  # 数字
     local k="$1" d="$2" v
     v=$(sed -n "s/.*\"$k\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$CONFIG_FILE" 2>/dev/null | head -1)
     [ -n "$v" ] && echo "$v" || echo "$d"
-}
-cfg_arr() {  # 字符串数组（game_packages）
-    local k="$1"
-    sed -n "/\"$k\"[[:space:]]*:[[:space:]]*\[/,/]/p" "$CONFIG_FILE" 2>/dev/null \
-        | grep -oE '"[^"]+"' | tr -d '"' | grep -v "^$k$"
 }
 
 # ---------------- 核心工具 ----------------
@@ -248,19 +265,15 @@ fg_pkgs() {
         | grep -oE '[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+' | head -1)
     echo "$out"
 }
-is_game() {  # $1=多行候选包名，任一命中即游戏
-    local pkg line cand
+is_game() {  # $1=多行候选包名，任一精确命中即游戏
+    local pkg line
     while IFS= read -r pkg; do
         [ -z "$pkg" ] && continue
         case "$pkg" in null) continue;; esac
         while IFS= read -r line; do
             [ -z "$line" ] && continue
             case "$line" in \#*) continue;; esac
-            if [ "$MATCH_MODE" = "contains" ]; then
-                case "$pkg" in *"$line"*) return 0;; esac
-            else
-                [ "$pkg" = "$line" ] && return 0
-            fi
+            [ "$pkg" = "$line" ] && return 0
         done <<LIST
 $GAME_LIST
 LIST
@@ -281,7 +294,6 @@ is_charging() {
 # ---------------- 主循环 ----------------
 LOCK_LIST=""
 GAME_LIST=""
-MATCH_MODE="exact"
 MIN_ONLINE=2
 DAILY_CAP=0
 AUTO_COUNT=1
@@ -384,11 +396,10 @@ run() {
             LOCK_LIST=$(echo "$LOCK_LIST" | tr ',' ' ')
         fi
         MIN_ONLINE=$(cfg_int min_online 2)
-        MATCH_MODE=$(cfg_val match_mode exact)
         INTERVAL=$(cfg_int poll_interval 5)
         NO_CHARGE=$(cfg_bool no_lock_charging false)
         DAILY_CAP=$(cfg_int daily_cap_pct 0)
-        GAME_LIST=$(cfg_arr game_packages)
+        GAME_LIST=$(grep -v '^#' "$PACKAGES_FILE" 2>/dev/null | grep -v '^$')
 
         case "$INTERVAL" in
             ''|*[!0-9]*) INTERVAL=5;;

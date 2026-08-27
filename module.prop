@@ -1,7 +1,7 @@
 id=CoreGate
 name=核心门控（大核封锁·游戏自动恢复）
-version=v1.3.0
-versionCode=130
+version=v1.3.5
+versionCode=135
 author=zimky
 description=日常使用自动封锁高频大核并可选限频降低功耗，检测到游戏（目标包名）自动恢复全部核心；支持 WebUI 可视化配置、锁核建议、息屏自动锁核、一键恢复原始状态/删除全部残留。完全可逆零残留。作者：zimky（与 DeepSeek 协作开发）。
 webui=true

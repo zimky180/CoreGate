@@ -26,6 +26,20 @@ if [ ! -f "$CONFIG_DIR/config.json" ]; then
     chmod 0644 "$CONFIG_DIR/config.json"
 fi
 
+# 游戏包名列表（独立纯文本，每行一个包名，升级不覆盖）
+if [ ! -f "$CONFIG_DIR/packages.txt" ]; then
+    if [ -f "$CONFIG_DIR/config.json" ] && grep -q '"game_packages"' "$CONFIG_DIR/config.json" 2>/dev/null; then
+        ui_print "- 迁移旧版游戏列表..."
+        sed -n '/"game_packages"/,/]/p' "$CONFIG_DIR/config.json" 2>/dev/null \
+            | grep -oE '"[^"]+"' | tr -d '"' | grep -v '^game_packages$' > "$CONFIG_DIR/packages.txt"
+    fi
+    if [ ! -s "$CONFIG_DIR/packages.txt" ]; then
+        ui_print "- 写入默认游戏列表..."
+        cp -f "$MODPATH/packages.txt" "$CONFIG_DIR/packages.txt"
+    fi
+    chmod 0644 "$CONFIG_DIR/packages.txt"
+fi
+
 # 检测核心拓扑（仅提示用）
 detect_high_cluster() {
     local maxf=0 c f out=""

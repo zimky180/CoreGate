@@ -24,32 +24,25 @@ jobs:
           echo "version=$(grep '^version=' module.prop | cut -d= -f2)" >> "$GITHUB_OUTPUT"
           echo "version_code=$(grep '^versionCode=' module.prop | cut -d= -f2)" >> "$GITHUB_OUTPUT"
 
-      # 用仓库内的纯 Perl 打包器（GitHub runner 自带 perl）
       - name: Package module zip
         run: |
-          perl tools/make_zip.pl CoreGate.zip CoreGate
+          zip -r -9 核心门控.zip \
+            module.prop customize.sh service.sh uninstall.sh sepolicy.rule \
+            config.example.json packages.txt webroot/index.html
           echo "--- zip contents ---"
-          perl -e '
-            my $f="CoreGate.zip"; open my $fh,"<:raw",$f or die $!;
-            local $/; my $d=<$fh>;
-            my $p=length($d)-22;
-            my ($s,$a,$b,$c,$n,$cdl,$cdo)=unpack("VvvvvVVv",substr($d,$p,22));
-            my $cd=substr($d,$cdo,$cdl); my $q=0;
-            for(1..$n){ my ($s2,$v,$v2,$fl,$m,$t,$dt,$crc,$cs,$us,$nl,$el,$cl,$dk,$ia,$ea,$off)=unpack("VvvvvvvVVVvvvvvVV",substr($cd,$q,46));
-              print "  ",substr($cd,$q+46,$nl),"\n"; $q+=46+$nl; }
-          '
+          unzip -l 核心门控.zip
 
       - name: Generate update.json
         run: |
-          cat > /tmp/update.json <<EOF
+          cat > update.json <<EOF
           {
             "version": "${{ steps.module_info.outputs.version }}",
             "versionCode": ${{ steps.module_info.outputs.version_code }},
-            "zipUrl": "https://github.com/zimky180/CoreGate/releases/download/${{ github.ref_name }}/CoreGate.zip",
+            "zipUrl": "https://github.com/zimky180/CoreGate/releases/download/${{ github.ref_name }}/%E6%A0%B8%E5%BF%83%E9%97%A8%E6%8E%A7.zip",
             "changelog": "https://github.com/zimky180/CoreGate/releases/tag/${{ github.ref_name }}"
           }
           EOF
-          cat /tmp/update.json
+          cat update.json
 
       - name: Commit update.json back to main
         run: |
@@ -57,7 +50,6 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin main
           git checkout main
-          cp /tmp/update.json update.json
           git add update.json
           git diff --cached --quiet || git commit -m "chore: update update.json for ${{ github.ref_name }}"
           git push origin main
@@ -65,5 +57,5 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: CoreGate.zip
+          files: 核心门控.zip
           generate_release_notes: true
