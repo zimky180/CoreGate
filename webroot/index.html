@@ -337,7 +337,7 @@ function fillForm(){
 
 function collect(){
   cfg.enabled = $('enabled').checked;
-  cfg.lock_cores = $('lock_cores').value.trim() || 'auto';
+  cfg.lock_cores = $('lock_cores').value.trim() || '';
   cfg.auto_lock_count = Math.min(4, Math.max(1, parseInt($('auto_lock_count').value, 10) || 1));
   cfg.disable_core_ctl = $('disable_core_ctl').checked;
   cfg.min_online = parseInt($('min_online').value, 10) || 2;
@@ -459,7 +459,7 @@ function updateLockList(n, locked){
   if(locked && idx < 0) list.push(n);
   if(!locked && idx >= 0) list.splice(idx, 1);
   list.sort(function(a,b){ return a-b; });
-  cfg.lock_cores = list.length ? list.join(',') : 'auto';
+  cfg.lock_cores = list.length ? list.join(',') : '';
   $('lock_cores').value = cfg.lock_cores;
   collect();
   saveConfig();
@@ -520,9 +520,16 @@ function refreshStatus(){
     var s = (r.stdout || '').trim();
     var parts = s.split('|');
     var mode = parts[0] || '';
-    var pill = $('modePill');
-    pill.className = 'pill ' + (mode === 'locked' ? 'lock' : mode === 'unlocked' ? 'unlock' : 'off');
-    pill.textContent = mode === 'locked' ? '🔒 已封锁大核' : mode === 'unlocked' ? '⚡ 全部核心在线' : mode === 'safe' ? '🛡️ 安全模式（未封锁）' : mode === 'off' ? '⏸ 模块已禁用' : '未运行';
+    // 状态按【实际在线核心】判断，避免"核全开了还显示已封锁"的误导
+    sh('for c in /sys/devices/system/cpu/cpu[0-9]*; do cat $c/online 2>/dev/null; done').then(function(r2){
+      var off = (r2.stdout || '').split('\n').filter(function(l){ return l === '0'; }).length;
+      var pill = $('modePill');
+      if(mode === 'safe'){ pill.className = 'pill off'; pill.textContent = '🛡️ 安全模式（未封锁）'; }
+      else if(mode === 'off'){ pill.className = 'pill off'; pill.textContent = '⏸ 模块已禁用'; }
+      else if(!mode){ pill.className = 'pill off'; pill.textContent = '未运行'; }
+      else if(off > 0){ pill.className = 'pill lock'; pill.textContent = '🔒 已封锁 ' + off + ' 个核心'; }
+      else { pill.className = 'pill unlock'; pill.textContent = '⚡ 全部核心在线'; }
+    });
     $('fgApp').textContent = (parts[1] && parts[1] !== '-' ? parts[1] : '-');
   });
   sh('cat ' + DIR + '/daemon.pid 2>/dev/null; kill -0 $(cat ' + DIR + '/daemon.pid 2>/dev/null) 2>/dev/null && echo RUNNING || echo STOPPED').then(function(r){
@@ -550,12 +557,20 @@ function testLock(lock){
   });
 }
 function restoreNow(){
-  if(!confirm('立即恢复全部核心/频率到原始状态？\n（服务进程继续运行，会按配置重新封锁）')) return;
+  if(!confirm('立即恢复全部核心/频率到原始状态？\n（同时取消自动封锁，保持全部核在线，等同游戏状态；\n想恢复自动封锁，把「封锁核心」填回 auto 保存即可）')) return;
   var cmd = 'for c in /sys/devices/system/cpu/cpu[0-9]*; do echo 1 > "$c/online" 2>/dev/null; done; ' +
     'for c in /sys/devices/system/cpu/cpu[0-9]*; do d="$c/cpufreq"; ' +
     '[ -f "$d/cpuinfo_max_freq" ] && echo "$(cat "$d/cpuinfo_max_freq" 2>/dev/null)" > "$d/scaling_max_freq" 2>/dev/null; ' +
     '[ -f "$d/cpuinfo_min_freq" ] && echo "$(cat "$d/cpuinfo_min_freq" 2>/dev/null)" > "$d/scaling_min_freq" 2>/dev/null; done; echo DONE';
-  sh(cmd).then(function(r){ toast('已恢复原始状态', 'ok'); refreshAll(); });
+  sh(cmd).then(function(r){
+    // 取消自动封锁：lock_cores 置空并保存，服务不再自动锁回（等同游戏状态）
+    $('lock_cores').value = '';
+    cfg.lock_cores = '';
+    collect();
+    saveConfig();
+    toast('已恢复原始状态，保持全部核在线', 'ok');
+    refreshAll();
+  });
 }
 function cleanupAll(){
   if(!confirm('彻底删除全部残留？\n\n将执行：\n1. 停止模块服务（其退出前自动恢复核心/频率）\n2. 恢复全部核心与频率\n3. 删除 /data/adb/CoreGate 全部数据\n\n模块将停止工作；重启后自动生成默认配置。')) return;

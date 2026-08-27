@@ -345,7 +345,7 @@ run() {
     AUTO_COUNT=$(cfg_int auto_lock_count 1)
     DISABLE_CC=$(cfg_bool disable_core_ctl false)
     LOCK_LIST=$(cfg_val lock_cores auto)
-    if [ "$LOCK_LIST" = "auto" ] || [ -z "$LOCK_LIST" ]; then
+    if [ "$LOCK_LIST" = "auto" ]; then
         LOCK_LIST=$(detect_high)
     else
         LOCK_LIST=$(echo "$LOCK_LIST" | tr ',' ' ')
@@ -390,7 +390,7 @@ run() {
         AUTO_COUNT=$(cfg_int auto_lock_count 1)
         DISABLE_CC=$(cfg_bool disable_core_ctl false)
         LOCK_LIST=$(cfg_val lock_cores auto)
-        if [ "$LOCK_LIST" = "auto" ] || [ -z "$LOCK_LIST" ]; then
+        if [ "$LOCK_LIST" = "auto" ]; then
             LOCK_LIST=$(detect_high)
         else
             LOCK_LIST=$(echo "$LOCK_LIST" | tr ',' ' ')
@@ -491,7 +491,11 @@ run() {
 
         # 游戏模式（unlocked）自动放大检测间隔，进一步省电
         if [ "$want_lock" = "yes" ]; then
-            sleep "$INTERVAL"
+            if [ "$ss" = "OFF" ]; then
+                sleep 30   # 息屏：拉长检测间隔，减少唤醒省电
+            else
+                sleep "$INTERVAL"
+            fi
         else
             sleep $((INTERVAL * 2))
         fi
