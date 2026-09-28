@@ -1,0 +1,61 @@
+name: Build Module and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read module.prop version info
+        id: module_info
+        run: |
+          echo "version=$(grep '^version=' module.prop | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          echo "version_code=$(grep '^versionCode=' module.prop | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Package module zip
+        run: |
+          zip -r -9 CoreGate.zip \
+            module.prop customize.sh service.sh uninstall.sh sepolicy.rule \
+            config.example.json packages.txt webroot/index.html
+          echo "--- zip contents ---"
+          unzip -l CoreGate.zip
+
+      - name: Generate update.json
+        run: |
+          cat > update.json <<EOF
+          {
+            "version": "${{ steps.module_info.outputs.version }}",
+            "versionCode": ${{ steps.module_info.outputs.version_code }},
+            "zipUrl": "https://github.com/zimky180/CoreGate/releases/download/${{ github.ref_name }}/CoreGate.zip",
+            "changelog": "https://github.com/zimky180/CoreGate/releases/tag/${{ github.ref_name }}"
+          }
+          EOF
+          cat update.json
+
+      - name: Commit update.json back to main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout main
+          git add update.json
+          git diff --cached --quiet || git commit -m "chore: update update.json for ${{ github.ref_name }}"
+          git push origin main
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: CoreGate.zip
+          generate_release_notes: true

@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "lock_cores": "auto",
+  "auto_lock_count": 1,
+  "disable_core_ctl": false,
+  "no_lock_charging": false,
+  "poll_interval": 30,
+  "limit_freq": false
+}
