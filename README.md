@@ -74,14 +74,6 @@ WebUI 提供「立即封锁 / 立即恢复」按钮，可验证你的内核是�
   - SELinux 拦截（本模块带 `sepolicy.rule`，一般可解；若你的 KernelSU 对规则报错可删除该文件）
   - 厂商温控/core_ctl 实时拉回（本模块每轮循环自动压制）
 
-## 发布更新
-
-改好代码后：
-1. 更新 `module.prop` 的 `version/versionCode`
-2. 更新 `update.json` 并放到你的 GitHub 仓库
-3. `perl tools/make_zip.pl CoreGate-vX.Y.Z.zip CoreGate` 打包
-4. 上传到 GitHub Release，`module.prop` 的 `updateJson` 指向 `update.json`
-
 ## 注意事项 / 免责声明
 
 - 封锁核心属于低风险但非零风险操作：**请先在 WebUI 用「立即封锁」测试**，确认日常流畅后再长期使用。
