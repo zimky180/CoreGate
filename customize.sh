@@ -72,6 +72,13 @@ if [ ! -f "$CONFIG_DIR/packages.txt" ]; then
     chmod 0644 "$CONFIG_DIR/packages.txt"
 fi
 
+# 录屏 / 相机包名列表（独立纯文本，每行一个包名，升级不覆盖）
+if [ ! -f "$CONFIG_DIR/capture.txt" ]; then
+    ui_print "- 写入默认录屏/相机列表..."
+    cp -f "$MODPATH/capture.txt" "$CONFIG_DIR/capture.txt"
+    chmod 0644 "$CONFIG_DIR/capture.txt"
+fi
+
 # 检测核心拓扑（仅提示用）
 detect_high_cluster() {
     local maxf=0 c f out=""

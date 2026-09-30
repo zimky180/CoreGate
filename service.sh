@@ -6,7 +6,8 @@
 #   日常使用 -> 通过 /sys/devices/system/cpu/cpuN/online 封锁高频大核
 #              （默认自动检测最高频簇，如骁龙 8 Gen 5 的 2 颗 3.8GHz 超大核）
 #   打开游戏 -> 检测到前台包名命中「游戏列表」时，恢复全部核心
-#   离开游戏 -> 重新封锁
+#   录屏/拍照 -> 检测到前台包名命中「录屏/相机清单」时，恢复全部核心
+#   离开游戏/录屏/相机 -> 重新封锁
 # ----------------------------------------------------------------
 # 配置：/data/adb/CoreGate/config.json（由 WebUI 写入，本脚本只读执行）
 # 日志：/data/adb/modules/CoreGate/log/coregate.log（模块本体目录，卸载随模块一起清除）
@@ -18,6 +19,7 @@ MODULE_ID=$(basename "$MODDIR")
 CONFIG_DIR="/data/adb/CoreGate"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 PACKAGES_FILE="$CONFIG_DIR/packages.txt"
+CAPTURE_FILE="$CONFIG_DIR/capture.txt"
 # 日志统一放模块本体目录下的 log 子目录；模块目录不可写时回退到配置目录
 if [ -d "$MODDIR" ] && [ -w "$MODDIR" ]; then
     LOG_DIR="$MODDIR/log"
@@ -28,6 +30,17 @@ LOG_FILE="$LOG_DIR/coregate.log"
 STATE_FILE="$CONFIG_DIR/state"
 PID_FILE="$CONFIG_DIR/daemon.pid"
 CORE_CTL_BACKUP="$CONFIG_DIR/corectl.state"
+
+# 录屏 / 相机内置默认包名（capture.txt 不存在或为空时兜底）
+# 这类应用需要全部核心在线才能流畅编码（录屏）或成片（相机）
+CAPTURE_DEFAULT="com.oplus.screenrecorder
+com.coloros.screenrecorder
+com.oneplus.screenrecord
+com.android.systemui.screenrecord
+com.oplus.camera
+com.oneplus.camera
+com.coloros.camera
+com.android.camera"
 
 mkdir -p "$LOG_DIR" 2>/dev/null
 
@@ -97,7 +110,9 @@ cfg_val() {  # 字符串
 }
 cfg_bool() {  # 布尔
     k="$1"; d="$2"
-    v=$(sed -n "s/.*\"$k\"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p" "$CONFIG_FILE" 2>/dev/null | head -1)
+    # 注意：必须用扩展正则(-E)，BusyBox 的 BRE 模式不支持 \(a\|b\) 交替语法，
+    # 用 BRE 会解析为空导致所有布尔项回退默认值（真机 v1.36.1 实测确认）。
+    v=$(sed -nE "s/.*\"$k\"[[:space:]]*:[[:space:]]*(true|false).*/\1/p" "$CONFIG_FILE" 2>/dev/null | head -1)
     [ -n "$v" ] && echo "$v" || echo "$d"
 }
 cfg_int() {  # 数字
@@ -152,7 +167,7 @@ restore_core_ctl() {
     rm -f "$CORE_CTL_BACKUP"
 }
 # 自动检测「最高频簇」= 需要封锁的大核（如 8 Gen 5 的 cpu6/cpu7）
-# 默认只锁 1 个（最稳，对应 Scene 实测可行的量），可在 WebUI 调 auto_lock_count 或手动指定
+# 默认只锁 1 个（最稳，对应 Scene 实测可行的量），也可在 WebUI 手动指定
 detect_high() {
     total=0; cap=0; maxf=0
     for c in $(all_cpus); do
@@ -204,11 +219,13 @@ do_unlock() {
 # 设计取舍：
 #   1) 用【绝对频率上限】而非百分比，避免不同核心硬件上限差异导致数学误差；
 #   2) 写入值 = 目标MHz*1000 + 800，让内核向下对齐到最近的合法档次；
-#   3) 仅当【当前读数偏离目标】才写，避免无意义刷写带来的额外 CPU 唤醒与功耗；
-#   4) 不做「连续写 4 次 + chmod 444 锁节点」的对抗式循环——那会与厂商调度持续打架，
-#      反而抬高功耗，并破坏系统对节点的合法写入能力（违背 CoreGate 完全可逆哲学）；
-#   5) GPU 只压 max_gpuclk / max_pwrlevel / min_pwrlevel / default_pwrlevel 与 devfreq，
-#      不锁死节点，靠主循环周期性纠偏即可。
+#   3) CPU 侧仅当【当前读数偏离目标】才写，避免无意义刷写带来的额外 CPU 唤醒与功耗；
+#   4) CPU 的 scaling_max_freq 系统不会频繁回写，温和单写即可生效；
+#      但 GPU 的 kgsl 节点（max_gpuclk / max_pwrlevel）会被系统周期性重设，
+#      单写一次会被立刻改回，必须采用「chmod 644 解锁 → 连写 4 次 → chmod 444 锁定」
+#      的强化写入方式，并在恢复时先 chmod 644 解锁再写回原值，保证完全可逆；
+#   5) GPU 仅压 max_gpuclk / max_pwrlevel（省电天花板）与 devfreq，
+#      写入频率需与 CPU 一样做 +800 对齐，否则精确值会被内核直接拒绝。
 FREQ_CAPPED=0
 # 锁定的安全上限（用户不可调）
 CAP_LITTLE_MHZ=2266      # policy0（小核簇）上限
@@ -246,16 +263,42 @@ restore_cluster() {
     [ -n "$_hw" ] && freq_write_if_needed "$_dir/scaling_max_freq" "$_hw"
 }
 
+# GPU(kgsl) 节点强化写入：系统会周期性重设 max_gpuclk / max_pwrlevel，
+# 单写一次会被立刻改回，故需 chmod 644 解锁 → 连写 4 次 → sync → chmod 444 锁定。
+# 恢复时由 gpu_restore_write 先 chmod 644 解锁再写回原值，保证可逆。
+gpu_force_write() {
+    _node="$1"; _val="$2"
+    [ -e "$_node" ] || return 1
+    i=0
+    while [ "$i" -lt 4 ]; do
+        chmod 644 "$_node" 2>/dev/null
+        echo "$_val" > "$_node" 2>/dev/null
+        i=$(( i + 1 ))
+    done
+    sync 2>/dev/null
+    chmod 444 "$_node" 2>/dev/null
+}
+# 恢复专用：先 chmod 644 解开锁定，再写回原值（不重新锁定）
+gpu_restore_write() {
+    _node="$1"; _val="$2"
+    [ -e "$_node" ] || return 1
+    chmod 644 "$_node" 2>/dev/null
+    _cur=$(cat "$_node" 2>/dev/null)
+    [ "$_cur" = "$_val" ] && return 0
+    echo "$_val" > "$_node" 2>/dev/null
+}
+
 apply_freq_cap() {
     [ "$LIMIT_FREQ" = "true" ] || return 0
     cap_cluster "$P0_DIR" "$CAP_LITTLE_MHZ"
     cap_cluster "$P6_DIR" "$CAP_BIG_MHZ"
-    # GPU：功耗档位与频率上限
-    freq_write_if_needed "$GPU_DIR/max_pwrlevel" "$CAP_GPU_PWRLEVEL"
-    freq_write_if_needed "$GPU_DIR/min_pwrlevel" "$CAP_GPU_PWRLEVEL"
-    freq_write_if_needed "$GPU_DIR/default_pwrlevel" "$CAP_GPU_PWRLEVEL"
-    [ -e "$GPU_DIR/max_gpuclk" ] && freq_write_if_needed "$GPU_DIR/max_gpuclk" "$(( CAP_GPU_MHZ * 1000000 ))"
-    [ -e "$GPU_DIR/devfreq/max_freq" ] && freq_write_if_needed "$GPU_DIR/devfreq/max_freq" "$(( CAP_GPU_MHZ * 1000000 ))"
+    # GPU：功耗档位与频率上限（kgsl 节点需强化写入，频率需 +800000 对齐）
+    gpu_clk=$(( CAP_GPU_MHZ * 1000000 + 800000 ))
+    # 只压 max_pwrlevel（省电天花板），不动 min/default（地板与起跳点）：
+    # 锁 max 即达成 500MHz 上限，压 min/default 不增加省电、反可能钳住降频下限，收益为零风险非零。
+    gpu_force_write "$GPU_DIR/max_pwrlevel" "$CAP_GPU_PWRLEVEL"
+    gpu_force_write "$GPU_DIR/max_gpuclk" "$gpu_clk"
+    [ -e "$GPU_DIR/devfreq/max_freq" ] && gpu_force_write "$GPU_DIR/devfreq/max_freq" "$gpu_clk"
     [ "$FREQ_CAPPED" = "1" ] || log "已启用日常限频：小核≤${CAP_LITTLE_MHZ}MHz 大核≤${CAP_BIG_MHZ}MHz GPU≤${CAP_GPU_MHZ}MHz/档位${CAP_GPU_PWRLEVEL}"
     FREQ_CAPPED=1
 }
@@ -265,11 +308,11 @@ remove_freq_cap() {
     restore_cluster "$P6_DIR"
     if [ -d "$GPU_DIR" ]; then
         hw=$(( GPU_RESTORE_MHZ / 1000000 ))
-        [ -e "$GPU_DIR/max_gpuclk" ] && freq_write_if_needed "$GPU_DIR/max_gpuclk" "$GPU_RESTORE_MHZ"
-        [ -e "$GPU_DIR/devfreq/max_freq" ] && freq_write_if_needed "$GPU_DIR/devfreq/max_freq" "$GPU_RESTORE_MHZ"
-        freq_write_if_needed "$GPU_DIR/max_pwrlevel" "0"
-        freq_write_if_needed "$GPU_DIR/min_pwrlevel" "0"
-        freq_write_if_needed "$GPU_DIR/default_pwrlevel" "0"
+        gpu_restore_write "$GPU_DIR/max_gpuclk" "$GPU_RESTORE_MHZ"
+        gpu_restore_write "$GPU_DIR/devfreq/max_freq" "$GPU_RESTORE_MHZ"
+        gpu_restore_write "$GPU_DIR/max_pwrlevel" "0"
+        gpu_restore_write "$GPU_DIR/min_pwrlevel" "0"
+        gpu_restore_write "$GPU_DIR/default_pwrlevel" "0"
     fi
     FREQ_CAPPED=0
     log "已取消日常限频，恢复硬件上限"
@@ -291,26 +334,36 @@ screen_sysfs() {
     echo UNKNOWN
 }
 
-# ---------------- 前台应用检测（多候选：覆盖全屏游戏/挂屏/焦点） ----------------
+# ---------------- 前台应用检测（多路回退：覆盖 ColorOS 各类前台字段） ----------------
+# 从一行文本中提取包名：优先取 "包名/Activity" 的包名，否则取首个形似包名的 token
+_fg_extract() {
+    sed -E 's/.*[ {]([a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+)\/[^ ]*.*/\1/' \
+        | grep -oE '[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+' | head -1
+}
 fg_pkgs() {
-    # 方式1：dumpsys window 多字段（ColorOS 全屏游戏/游戏空间前台更可靠）
+    # 方式1：dumpsys window 多字段（全屏游戏/游戏空间/挂屏/焦点，取所有命中的包名）
     out=$(dumpsys window 2>/dev/null \
-        | grep -E 'mCurrentFocus|mFocusedApp|mHoldScreenWindow|mTopFullscreenOpaque|mObscuringWindow|mLastFocusedWindow' \
+        | grep -E 'mCurrentFocus|mFocusedApp|mHoldScreenWindow|mTopFullscreenOpaque|mObscuringWindow|mLastFocusedWindow|mFocusedWindow' \
         | sed -E 's/.* ([a-zA-Z0-9.]+)\/.*/\1/' \
         | grep -E '^[a-zA-Z][a-zA-Z0-9_.]*$' | grep -v '^null$' | sort -u)
     if [ -n "$out" ]; then
         echo "$out"
         return
     fi
-    # 方式2：activity 状态
+    # 方式2：activity 栈里的当前活跃 Activity（ColorOS 最可靠）
     out=$(dumpsys activity activities 2>/dev/null \
-        | grep -m1 -E 'mResumedActivity|topResumedActivity' \
-        | grep -oE '[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+' | head -1)
+        | grep -m1 -E 'mResumedActivity|topResumedActivity|ResumedActivity' \
+        | _fg_extract)
     [ -n "$out" ] && { echo "$out"; return; }
-    # 方式3：mCurrentFocus 兜底
+    # 方式3：dumpsys activity 的顶层信息（部分机型只有这里准）
+    out=$(dumpsys activity 2>/dev/null \
+        | grep -m1 -E 'mResumedActivity|topResumedActivity|ResumedActivity' \
+        | _fg_extract)
+    [ -n "$out" ] && { echo "$out"; return; }
+    # 方式4：window 的焦点兜底
     out=$(dumpsys window 2>/dev/null \
-        | grep -m1 'mCurrentFocus' \
-        | grep -oE '[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)+' | head -1)
+        | grep -m1 -E 'mCurrentFocus|mFocusedApp' \
+        | _fg_extract)
     echo "$out"
 }
 is_game() {  # $1=多行候选包名，任一精确命中即游戏
@@ -329,6 +382,22 @@ $1
 PKGS
     return 1
 }
+is_capture() {  # $1=多行候选包名，任一精确命中即录屏/相机（需要全核在线）
+    while IFS= read -r pkg; do
+        [ -z "$pkg" ] && continue
+        case "$pkg" in null) continue;; esac
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue;; esac
+            [ "$pkg" = "$line" ] && return 0
+        done <<LIST
+$CAPTURE_LIST
+LIST
+    done <<PKGS
+$1
+PKGS
+    return 1
+}
 
 # ---------------- 屏幕 / 充电状态 ----------------
 is_charging() {
@@ -340,6 +409,7 @@ is_charging() {
 # ---------------- 主循环 ----------------
 LOCK_LIST=""
 GAME_LIST=""
+CAPTURE_LIST=""
 LIMIT_FREQ="false"
 AUTO_COUNT=1
 DISABLE_CC="false"
@@ -447,14 +517,28 @@ run() {
             LOCK_LIST=$(echo "$LOCK_LIST" | tr ',、' ' ' | tr -s ' ')
         fi
         LIMIT_FREQ=$(cfg_bool limit_freq false)
-        # poll_interval：唯一的循环周期来源（默认 30 秒，省电优先）
-        INTERVAL=$(cfg_int poll_interval 30)
+        # poll_interval：检测间隔（秒）。0 表示"自动"——跟随限频开关：
+        #   开启日常限频 → 10 秒（加快限频被系统重设后的自愈）；关闭限频 → 30 秒（省电）。
+        # 用户手动填 5~600 时一律尊重用户值，不做任何联动覆盖。
+        INTERVAL=$(cfg_int poll_interval 0)
         NO_CHARGE=$(cfg_bool no_lock_charging false)
         GAME_LIST=$(grep -v '^#' "$PACKAGES_FILE" 2>/dev/null | grep -v '^$')
+        # 录屏 / 相机自动恢复：开关关闭则跳过检测；开启时优先读 capture.txt，读空/缺失用内置默认兜底
+        CAPTURE_BOOST=$(cfg_bool capture_boost false)
+        if [ "$CAPTURE_BOOST" = "true" ]; then
+            CAPTURE_LIST=$(grep -v '^#' "$CAPTURE_FILE" 2>/dev/null | grep -v '^$')
+            [ -z "$CAPTURE_LIST" ] && CAPTURE_LIST="$CAPTURE_DEFAULT"
+        else
+            CAPTURE_LIST=""
+        fi
 
         case "$INTERVAL" in
-            ''|*[!0-9]*) INTERVAL=30;;
+            ''|*[!0-9]*) INTERVAL=0;;
         esac
+        # 0 = 自动跟随限频开关；用户手动值（≥5）保持不动
+        if [ "$INTERVAL" -eq 0 ]; then
+            if [ "$LIMIT_FREQ" = "true" ]; then INTERVAL=10; else INTERVAL=30; fi
+        fi
         [ "$INTERVAL" -lt 5 ] && INTERVAL=5
         [ "$INTERVAL" -gt 600 ] && INTERVAL=600
 
@@ -507,8 +591,10 @@ run() {
 
         # ---- 决策：是否封锁（息屏一律锁定） ----
         want_lock=yes
-        if [ "$ss" != "OFF" ] && [ -n "$GAME_LIST" ]; then
-            is_game "$PKGS" && want_lock=no
+        # 游戏 或 录屏/相机：两者都需要全部核心在线，命中任一即不封锁
+        if [ "$ss" != "OFF" ]; then
+            [ -n "$GAME_LIST" ] && is_game "$PKGS" && want_lock=no
+            [ "$want_lock" = "yes" ] && [ -n "$CAPTURE_LIST" ] && is_capture "$PKGS" && want_lock=no
         fi
         # 充电时不封锁
         if [ "$want_lock" = "yes" ] && [ "$NO_CHARGE" = "true" ] && is_charging; then
@@ -524,7 +610,7 @@ run() {
             fi
             do_lock
             apply_freq_cap
-            # 仅在状态切换时打印封锁结果，避免默认 30 秒一轮刷爆日志
+            # 仅在状态切换时打印封锁结果，避免每轮刷爆日志
             if [ "$state_changed" = "1" ]; then
                 oc_now=$(online_count)
                 log "封锁结果：[${LOCK_STATE}] 当前在线核心 ${oc_now} 个"
@@ -536,7 +622,7 @@ run() {
             fi
         else
             if [ "$state" != "unlocked" ]; then
-                log "切换为游戏模式：恢复全部核心（前台: $pkg）"
+                log "切换为性能模式：恢复全部核心（前台: $pkg）"
             fi
             do_unlock
             remove_freq_cap

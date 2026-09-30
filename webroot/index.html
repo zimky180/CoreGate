@@ -187,13 +187,6 @@
   </div>
   <div class="row">
     <div>
-      <div class="lbl">自动封锁数量</div>
-      <div class="hint">建议先 1 个，稳定后再试 2 个（见上方建议）</div>
-    </div>
-    <input type="number" class="num" id="auto_lock_count" min="1" max="4" value="1">
-  </div>
-  <div class="row">
-    <div>
       <div class="lbl">关闭 core_ctl</div>
       <div class="hint">默认关（不碰厂商调度）；核总被拉回再开</div>
     </div>
@@ -212,6 +205,19 @@
   <div class="hint" style="margin-top:8px">添加游戏：换行输入包名 → 点「保存配置」生效。命中列表 → 自动恢复全部核心。</div>
 </div>
 
+<!-- 录屏 / 相机 -->
+<div class="card">
+  <h2>录屏 / 相机自动恢复</h2>
+  <div class="row">
+    <div>
+      <div class="lbl">检测到录屏 / 相机时恢复全部核心</div>
+      <div class="hint">默认关。开启后这些应用出现在前台时自动解除封锁，保证录屏编码与相机成片不掉帧。</div>
+    </div>
+    <label class="sw"><input type="checkbox" id="capture_boost"><i></i></label>
+  </div>
+  <div class="hint" style="margin-top:8px">内置包名：com.oplus.screenrecorder（录屏）、com.oplus.camera（相机）等，已适配 OPPO / ColorOS / 一加。</div>
+</div>
+
 <!-- 策略 -->
 <div class="card">
   <h2>策略</h2>
@@ -225,9 +231,9 @@
   <div class="row">
     <div>
       <div class="lbl">检测间隔（秒）</div>
-      <div class="hint">5~600，默认 30 秒。越大越省电（息屏时不做任何检测）</div>
+      <div class="hint">填 0 = 自动跟随限频开关（关限频 30 秒 / 开限频 10 秒）；也可手填 5~600 固定间隔，填了就完全按你的值走。</div>
     </div>
-    <input type="number" class="num" id="poll_interval" min="5" max="600" value="30">
+    <input type="number" class="num" id="poll_interval" min="0" max="600" value="0">
   </div>
   <div class="info">💡 息屏时模块自动封锁大核、不做任何检测（息屏没有游戏可点，纯省电）；亮屏时才检测前台应用。</div>
 </div>
@@ -245,6 +251,18 @@
   <div class="tips">小核簇 ≤ 2266 MHz · 大核簇 ≤ 1651 MHz · GPU ≤ 500 MHz（功耗档 13）。
 仅在当前频率偏离目标时才写入，避免与厂商调度反复拉扯。
 ⚠️ 若发现日常卡顿或游戏掉帧，请关闭本项。</div>
+
+  <!-- 限频生效实况：直接读内核节点，明明白白看到底生没生效 -->
+  <div class="row" style="margin-top:14px;align-items:flex-start">
+    <div style="flex:1">
+      <div class="lbl">限频生效实况</div>
+      <div class="hint">直接读取内核节点当前值，与目标上限逐项比对。「已锁定」= 内核实际值已等于目标；「已放开」= 处于游戏/恢复状态。</div>
+    </div>
+  </div>
+  <div id="freqLive">
+    <div style="color:var(--sub);font-size:12px">加载中…</div>
+  </div>
+  <div style="margin-top:9px"><button onclick="refreshFreqCap()">↻ 刷新限频实况</button></div>
 </details>
 
 <!-- 诊断 -->
@@ -320,9 +338,10 @@ function toast(msg, type){
 // ---------- 配置 ----------
 var DEFAULTS = {
   enabled: true, lock_cores: 'auto',
-  auto_lock_count: 1, disable_core_ctl: false,
-  poll_interval: 30,
-  limit_freq: false, no_lock_charging: false
+  disable_core_ctl: false,
+  poll_interval: 0,
+  limit_freq: false, no_lock_charging: false,
+  capture_boost: false,
 };
 var cfg = JSON.parse(JSON.stringify(DEFAULTS));
 
@@ -337,21 +356,26 @@ function updateGameCount(){
 function fillForm(){
   $('enabled').checked = !!cfg.enabled;
   $('lock_cores').value = cfg.lock_cores === 'auto' ? 'auto' : cfg.lock_cores;
-  $('auto_lock_count').value = cfg.auto_lock_count;
   $('disable_core_ctl').checked = !!cfg.disable_core_ctl;
   $('limit_freq').checked = !!cfg.limit_freq;
   $('no_lock_charging').checked = !!cfg.no_lock_charging;
+  $('capture_boost').checked = !!cfg.capture_boost;
   $('poll_interval').value = cfg.poll_interval;
 }
 
 function collect(){
   cfg.enabled = $('enabled').checked;
   cfg.lock_cores = $('lock_cores').value.trim() || '';
-  cfg.auto_lock_count = Math.min(4, Math.max(1, parseInt($('auto_lock_count').value, 10) || 1));
   cfg.disable_core_ctl = $('disable_core_ctl').checked;
   cfg.limit_freq = $('limit_freq').checked;
   cfg.no_lock_charging = $('no_lock_charging').checked;
-  cfg.poll_interval = Math.min(600, Math.max(5, parseInt($('poll_interval').value, 10) || 30));
+  cfg.capture_boost = $('capture_boost').checked;
+  cfg.poll_interval = (function(){
+    var n = parseInt($('poll_interval').value, 10);
+    if (n === 0) return 0;                       // 0 = 自动
+    if (isNaN(n)) return 0;
+    return Math.min(600, Math.max(5, n));        // 手填值钳到 5~600
+  })();
   updateGameCount();
 }
 
@@ -392,7 +416,6 @@ function loadConfig(){
     return loadPackages();
   });
 }
-
 // 读取游戏包名列表：独立纯文本文件，每行一个，绝无解析问题
 function loadPackages(){
   return sh('cat ' + PACKAGES + ' 2>/dev/null').then(function(r){
@@ -478,7 +501,7 @@ function renderAdvice(cores){
   var maxf = 0;
   cores.forEach(function(c){ if(c.max > maxf) maxf = c.max; });
   var high = cores.filter(function(c){ return c.max === maxf && maxf > 0; }).length;
-  var cur = cfg.lock_cores === 'auto' ? cfg.auto_lock_count : cfg.lock_cores.trim().split(/\s+/).filter(Boolean).length;
+  var cur = cfg.lock_cores === 'auto' ? 1 : cfg.lock_cores.trim().split(/\s+/).filter(Boolean).length;
 
   var rec, recTxt;
   if(total <= 4){ rec = '0~1'; recTxt = '核心数较少，不建议封锁，最多 1 颗'; }
@@ -490,7 +513,7 @@ function renderAdvice(cores){
   $('adviceBox').innerHTML =
     '<div>共 <span class="tag">' + total + ' 核</span> 在线 <span class="tag" style="background:rgba(52,199,89,.14);border-color:rgba(52,199,89,.35);color:#7ee2a0">' + online + '</span> 已封锁 <span class="tag" style="background:rgba(255,69,58,.13);border-color:rgba(255,69,58,.35);color:#ff7b70">' + off + '</span></div>' +
     '<div style="margin-top:7px">💡 推荐封锁：<b style="color:#bcd3ff">' + rec + '</b> 颗 — ' + recTxt + '</div>' +
-    '<div style="margin-top:5px">当前配置：' + (cfg.lock_cores === 'auto' ? '自动（' + cfg.auto_lock_count + ' 颗）' : '手动 ' + cfg.lock_cores) + '</div>' +
+    '<div style="margin-top:5px">当前配置：' + (cfg.lock_cores === 'auto' ? '自动（最高频 1 颗）' : '手动 ' + cfg.lock_cores) + '</div>' +
     '<div style="margin-top:5px">当前实际封锁：' + lockedNames + '</div>';
 }
 
@@ -514,10 +537,91 @@ function searchGames(){
   }
 }
 
+// ---------- 限频生效实况（读真实节点，和目标逐项比对） ----------
+var FREQ_TARGET = { little: 2266, big: 1651, gpu: 500, gpuPwr: 13 };
+function refreshFreqCap(){
+  var box = $('freqLive');
+  if(!box) return;
+  var cmd = 'P0=/sys/devices/system/cpu/cpufreq/policy0; P6=/sys/devices/system/cpu/cpufreq/policy6; G=/sys/class/kgsl/kgsl-3d0; ' +
+            'echo "L=$(cat $P0/scaling_max_freq 2>/dev/null)"; ' +
+            'echo "B=$(cat $P6/scaling_max_freq 2>/dev/null)"; ' +
+            'echo "Lc=$(cat $P0/scaling_cur_freq 2>/dev/null)"; ' +
+            'echo "Bc=$(cat $P6/scaling_cur_freq 2>/dev/null)"; ' +
+            'echo "G=$(cat $G/max_gpuclk 2>/dev/null)"; ' +
+            'echo "Gp=$(cat $G/max_pwrlevel 2>/dev/null)"; ' +
+            'echo "Gc=$(cat $G/gpuclk 2>/dev/null)"';
+  sh(cmd).then(function(r){
+    var kv = {};
+    (r.stdout || '').trim().split('\n').forEach(function(l){
+      var i = l.indexOf('=');
+      if(i > 0) kv[l.slice(0, i)] = l.slice(i + 1).trim();
+    });
+    var lMax = parseInt(kv.L, 10), bMax = parseInt(kv.B, 10);
+    var lCur = parseInt(kv.Lc, 10), bCur = parseInt(kv.Bc, 10);
+    var gMax = parseInt(kv.G, 10), gPwr = parseInt(kv.Gp, 10), gCur = parseInt(kv.Gc, 10);
+    function mhz(v, d){ return isNaN(v) ? '—' : (v / d).toFixed(0); }
+
+    // 判定：内核值 == 目标 → 已锁定；≠ 目标 → 未生效；读不到 → 未知
+    var items = [
+      { name: '小核簇上限',  cur: lMax, div: 1000,    tgt: FREQ_TARGET.little, curF: lCur, curDiv: 1000, unit: 'MHz' },
+      { name: '大核簇上限',  cur: bMax, div: 1000,    tgt: FREQ_TARGET.big,    curF: bCur, curDiv: 1000, unit: 'MHz' },
+      { name: 'GPU 上限',    cur: gMax, div: 1000000, tgt: FREQ_TARGET.gpu,    curF: gCur, curDiv: 1000000, unit: 'MHz' },
+      { name: 'GPU 功耗档',  cur: gPwr, div: 1,       tgt: FREQ_TARGET.gpuPwr, curF: null, curDiv: 1, unit: '' }
+    ];
+    // 判断逻辑：把 GPU 节点值换算成 MHz 后，允许 ±2MHz 容差（内核对齐）
+    function verdict(it){
+      if(isNaN(it.cur)) return { s: 'unknown', t: '节点读不到', c: 'var(--sub)' };
+      var curMHz = it.div === 1 ? it.cur : it.cur / it.div;
+      var diff = Math.abs(curMHz - it.tgt);
+      if(diff <= 2) return { s: 'locked', t: '已锁定', c: 'var(--ok)' };
+      if(curMHz > it.tgt + 2) return { s: 'loose', t: '未生效（上限偏高）', c: 'var(--err)' };
+      return { s: 'unknown', t: '值异常', c: 'var(--sub)' };
+    }
+
+    var html = '<div class="kvs">';
+    var lockedN = 0, looseN = 0;
+    items.forEach(function(it){
+      var v = verdict(it);
+      if(v.s === 'locked') lockedN++;
+      if(v.s === 'loose') looseN++;
+      var real = it.div === 1 ? (isNaN(it.cur) ? '—' : it.cur) : mhz(it.cur, it.div);
+      var realNow = it.curF != null && !isNaN(it.curF) ? mhz(it.curF, it.curDiv) : null;
+      html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.07)">' +
+                '<span style="font-size:12.5px;color:var(--txt)">' + it.name +
+                  '<span style="color:var(--sub);font-size:11px"> 目标 ' + it.tgt + it.unit + '</span></span>' +
+                '<span style="text-align:right">' +
+                  '<b style="color:' + v.c + ';font-size:13px">' + v.t + '</b>' +
+                  '<span style="color:var(--sub);font-size:11px;font-family:monospace"> 实值 ' + real + it.unit +
+                    (realNow ? ' · 实时 ' + realNow + it.unit : '') + '</span>' +
+                '</span>' +
+              '</div>';
+    });
+    html += '</div>';
+
+    // 顶部一句话总结
+    var sum, sumC;
+    if(!$('limit_freq').checked){
+      sum = '限频开关【已关闭】——下方为当前内核值（应等于硬件上限，说明已完全放开）';
+      sumC = 'var(--sub)';
+    } else if(looseN === 0 && lockedN >= 3){
+      sum = '✅ 限频【已生效】——3 项上限均已锁到目标档位';
+      sumC = 'var(--ok)';
+    } else if(lockedN === 0){
+      sum = '❌ 限频【未生效】——内核值仍为硬件上限，请查看日志排查';
+      sumC = 'var(--err)';
+    } else {
+      sum = '⚠️ 限频【部分生效】——' + lockedN + ' 项已锁、' + looseN + ' 项未锁';
+      sumC = '#ffb3ab';
+    }
+    box.innerHTML = '<div style="font-size:12.5px;font-weight:600;color:' + sumC + ';margin-bottom:6px">' + sum + '</div>' + html;
+  });
+}
+
 // ---------- 状态 ----------
 function refreshAll(){
   refreshStatus();
   refreshCores();
+  refreshFreqCap();
   refreshLog();
 }
 function refreshStatus(){
@@ -531,7 +635,17 @@ function refreshStatus(){
       var pill = $('modePill');
       if(mode === 'safe'){ pill.className = 'pill off'; pill.textContent = '🛡️ 安全模式（未封锁）'; }
       else if(mode === 'off'){ pill.className = 'pill off'; pill.textContent = '⏸ 模块已禁用'; }
-      else if(!mode){ pill.className = 'pill off'; pill.textContent = '未运行'; }
+      else if(!mode){
+        // state 为空：可能是「服务尚未写出状态」（开机/重启后的启动空窗期）。
+        // 结合服务进程是否存活区分，避免急急忙忙的用户误判为「没生效」。
+        sh('kill -0 $(cat ' + DIR + '/daemon.pid 2>/dev/null) 2>/dev/null && echo RUNNING || echo STOPPED').then(function(r3){
+          var alive = (r3.stdout || '').trim() === 'RUNNING';
+          var p = $('modePill');
+          if(alive){ p.className = 'pill off'; p.textContent = '⏳ 服务正在启动，请稍候…'; }
+          else { p.className = 'pill off'; p.textContent = '未运行'; }
+        });
+        return;
+      }
       else if(off > 0){ pill.className = 'pill lock'; pill.textContent = '🔒 已封锁 ' + off + ' 个核心'; }
       else { pill.className = 'pill unlock'; pill.textContent = '⚡ 全部核心在线'; }
     });
@@ -617,22 +731,33 @@ function cleanupAll(){
   sh(cmd).then(function(r){ toast('已删除全部残留，系统恢复原始状态', 'ok'); refreshAll(); });
 }
 
-// ---------- 事件 ----------
-document.addEventListener('change', function(e){
-  // 预留
-});
+// 限频开关联动检测间隔：仅当间隔为 0（自动）或恰为 10/30（视为未自定义）时才跟随切换，
+// 用户手动填过其它值（如 60）则完全尊重，不覆盖。
+ document.addEventListener('change', function(e){
+   if(e.target && e.target.id === 'limit_freq'){
+     var cur = parseInt($('poll_interval').value, 10);
+     var autoLike = (cur === 0 || cur === 10 || cur === 30);
+     if(autoLike){
+       $('poll_interval').value = e.target.checked ? 10 : 30;
+       collect();
+       toast(e.target.checked
+         ? '已开启限频，检测间隔自动调为 10 秒以加快自愈（可手动改回）'
+         : '已关闭限频，检测间隔自动调回 30 秒以省电（可手动改回）', 'warn');
+     }
+   }
+ });
 $('game_packages').addEventListener('input', updateGameCount);
 $('gameSearch').addEventListener('input', searchGames);
 
 loadConfig().then(refreshAll);
-var pollTimer = setInterval(function(){ refreshStatus(); refreshCores(); }, 5000);
+var pollTimer = setInterval(function(){ refreshStatus(); refreshCores(); refreshFreqCap(); }, 5000);
 document.addEventListener('visibilitychange', function(){
   if (document.hidden) {
     clearInterval(pollTimer);
     pollTimer = null;
   } else {
-    refreshStatus(); refreshCores();
-    if (!pollTimer) pollTimer = setInterval(function(){ refreshStatus(); refreshCores(); }, 5000);
+    refreshStatus(); refreshCores(); refreshFreqCap();
+    if (!pollTimer) pollTimer = setInterval(function(){ refreshStatus(); refreshCores(); refreshFreqCap(); }, 5000);
   }
 });
 </script>

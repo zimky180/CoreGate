@@ -28,7 +28,7 @@ jobs:
         run: |
           zip -r -9 CoreGate.zip \
             module.prop customize.sh service.sh uninstall.sh sepolicy.rule \
-            config.example.json packages.txt webroot/index.html
+            config.example.json packages.txt capture.txt webroot/index.html
           echo "--- zip contents ---"
           unzip -l CoreGate.zip
 
