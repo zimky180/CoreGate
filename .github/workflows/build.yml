@@ -1,5 +1,4 @@
 name: Build Module and Release
-
 on:
   push:
     tags:
@@ -21,25 +20,43 @@ jobs:
       - name: Read module.prop version info
         id: module_info
         run: |
-          echo "version=$(grep '^version=' module.prop | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-          echo "version_code=$(grep '^versionCode=' module.prop | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          VERSION=$(grep '^version=' module.prop | cut -d= -f2)
+          VCODE=$(grep '^versionCode=' module.prop | cut -d= -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VCODE" >> "$GITHUB_OUTPUT"
+          echo "version: $VERSION ($VCODE)"
 
       - name: Package module zip
+        id: pack
         run: |
-          zip -r -9 CoreGate.zip \
-            module.prop customize.sh service.sh uninstall.sh sepolicy.rule \
-            config.example.json packages.txt capture.txt webroot/index.html
+          # 模块 zip 只包含脚本与资源文件。
+          # v2.2.0 起已移除 KernelSU WebUI，配置入口统一为原生 App，
+          # 故 zip 内不含 webroot/、也不含 system/ 目录树。
+          set -e
+          FILES="module.prop customize.sh service.sh uninstall.sh sepolicy.rule config.example.json packages.txt capture.txt update.json README.md LICENSE"
+          TAG="${{ github.ref_name }}"
+          case "$TAG" in
+            v*) ;;
+            *) TAG="v${{ steps.module_info.outputs.version }}"; TAG="${TAG#vv}" ; TAG="v$TAG" ;;
+          esac
+          ZIPNAME="CoreGate-${TAG}.zip"
+          # shellcheck disable=SC2086
+          zip -r -9 "$ZIPNAME" $FILES
           echo "--- zip contents ---"
-          unzip -l CoreGate.zip
+          unzip -l "$ZIPNAME"
+          echo "zipname=$ZIPNAME" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Generate update.json
         run: |
+          TAG="${{ steps.pack.outputs.tag }}"
+          ZIPNAME="${{ steps.pack.outputs.zipname }}"
           cat > update.json <<EOF
           {
             "version": "${{ steps.module_info.outputs.version }}",
             "versionCode": ${{ steps.module_info.outputs.version_code }},
-            "zipUrl": "https://github.com/zimky180/CoreGate/releases/download/${{ github.ref_name }}/CoreGate.zip",
-            "changelog": "https://github.com/zimky180/CoreGate/releases/tag/${{ github.ref_name }}"
+            "zipUrl": "https://github.com/zimky180/CoreGate/releases/download/${TAG}/${ZIPNAME}",
+            "changelog": "https://github.com/zimky180/CoreGate/releases/tag/${TAG}"
           }
           EOF
           cat update.json
@@ -51,11 +68,12 @@ jobs:
           git fetch origin main
           git checkout main
           git add update.json
-          git diff --cached --quiet || git commit -m "chore: update update.json for ${{ github.ref_name }}"
+          git diff --cached --quiet || git commit -m "chore: update update.json for ${{ steps.pack.outputs.tag }}"
           git push origin main
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: CoreGate.zip
+          tag_name: ${{ steps.pack.outputs.tag }}
+          files: ${{ steps.pack.outputs.zipname }}
           generate_release_notes: true

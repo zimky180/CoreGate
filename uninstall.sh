@@ -35,13 +35,19 @@ for c in $(ls -d /sys/devices/system/cpu/cpu[0-9]* 2>/dev/null | sed 's/.*cpu//'
 done
 
 ui_print "- 恢复 GPU 频率/功耗档位..."
+# 注意：service.sh 限频时会把 kgsl 节点 chmod 444 锁定，若此处不解锁，
+# 下面的写回会因权限被拒而静默失败 → GPU 永久卡在限频状态。
+# 因此必须先 chmod 644 解开锁定，再写回原始上限。
 GPU_DIR="/sys/class/kgsl/kgsl-3d0"
 if [ -d "$GPU_DIR" ]; then
+    for _n in "$GPU_DIR/max_gpuclk" "$GPU_DIR/devfreq/max_freq" "$GPU_DIR/max_pwrlevel"; do
+        [ -e "$_n" ] && chmod 644 "$_n" 2>/dev/null
+    done
+    # 恢复真实最大合法档（本机 1225000000），而非厂商虚标的 cpuinfo 值
     [ -e "$GPU_DIR/max_gpuclk" ] && echo "1225000000" > "$GPU_DIR/max_gpuclk" 2>/dev/null
     [ -e "$GPU_DIR/devfreq/max_freq" ] && echo "1225000000" > "$GPU_DIR/devfreq/max_freq" 2>/dev/null
+    # 解限 = 允许 GPU 跑最高性能档 0；min/default 从未被 CoreGate 改动，绝不动它
     [ -e "$GPU_DIR/max_pwrlevel" ] && echo "0" > "$GPU_DIR/max_pwrlevel" 2>/dev/null
-    [ -e "$GPU_DIR/min_pwrlevel" ] && echo "0" > "$GPU_DIR/min_pwrlevel" 2>/dev/null
-    [ -e "$GPU_DIR/default_pwrlevel" ] && echo "0" > "$GPU_DIR/default_pwrlevel" 2>/dev/null
 fi
 
 ui_print "- 恢复 core_ctl 原始状态..."
@@ -50,6 +56,30 @@ if [ -f "$CORE_CTL_BACKUP" ]; then
         [ -z "$node" ] && continue
         echo "$val" > "$node" 2>/dev/null
     done < "$CORE_CTL_BACKUP"
+fi
+
+# 说明：v2.1.0 起 APK 为【独立应用】（方案 A：不注入系统分区），
+#       与模块解耦——模块卸载不影响 App，App 删除也不影响模块。
+#       因此这里不再清理任何应用，只需恢复系统状态与数据文件。
+ui_print "- 恢复被停用的系统组件..."
+# 关键：组件停用记录存在 $CONFIG_DIR/freeze.state 里，而下面会 rm -rf 整个 CONFIG_DIR。
+# 若不在这之前把组件逐个 enable 回来，用户卸载模块后这些系统组件会永久处于停用状态，
+# 造成「卸载了但功能再也回不来」的严重残留 —— 必须放在删除数据之前。
+FREEZE_STATE="$CONFIG_DIR/freeze.state"
+if [ -f "$FREEZE_STATE" ]; then
+    # 记录格式：每行「包名<TAB>原始状态」
+    # 只恢复原始态为 enabled 的（那才是本模块改过的）；
+    # 原始态为 disabled 的是用户自己停用的，卸载时保持原样，不擅自打开。
+    TAB="$(printf '\t')"
+    while IFS="$TAB" read -r _p _st; do
+        [ -z "$_p" ] && continue
+        if [ "$_st" = "enabled" ]; then
+            pm enable --user 0 "$_p" >/dev/null 2>&1
+            ui_print "  · 已恢复 $_p"
+        else
+            ui_print "  · 保持停用 $_p（原本就是您手动停用的）"
+        fi
+    done < "$FREEZE_STATE"
 fi
 
 ui_print "- 清理数据文件..."

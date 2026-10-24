@@ -3,7 +3,13 @@
   "lock_cores": "auto",
   "disable_core_ctl": false,
   "no_lock_charging": false,
-  "poll_interval": 0,
+  "poll_interval": 30,
   "limit_freq": false,
-  "capture_boost": false
+  "capture_boost": false,
+  "freeze_grp_log": false,
+  "freeze_grp_media": false,
+  "freeze_grp_cloud": false,
+  "freeze_grp_diag": false,
+  "freeze_grp_ad": false,
+  "freeze_grp_self": false
 }

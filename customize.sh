@@ -107,4 +107,5 @@ fi
 
 ui_print "✅ 安装完成！"
 ui_print "  重启后打开 KernelSU 管理器 → 模块"
-ui_print "  进入 CoreGate 的 WebUI 添加游戏包名"
+ui_print "  安装「核心门控」App 后在 App 内添加游戏包名"
+ui_print "  不安装 App 也能正常锁核（使用默认配置）"
