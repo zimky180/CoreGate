@@ -47,6 +47,7 @@ ui_print "- 设置脚本权限..."
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$MODPATH/service.sh" 0 0 0755
 set_perm "$MODPATH/uninstall.sh" 0 0 0755
+set_perm "$MODPATH/action.sh" 0 0 0755
 
 # 数据目录放模块外：升级模块不覆盖配置
 CONFIG_DIR="/data/adb/CoreGate"
@@ -79,6 +80,21 @@ if [ ! -f "$CONFIG_DIR/capture.txt" ]; then
     chmod 0644 "$CONFIG_DIR/capture.txt"
 fi
 
+# 老机型模拟配置的镜像副本
+#
+# 为什么要镜像：/data/adb 权限是 700，被注入进抖音的进程（普通 uid）连目录都进不去，
+# 读不到 /data/adb/CoreGate/spoof.json，于是 hook 永远不生效。
+# /data/local/tmp 是 drwxrwx--x，普通进程能进能读，所以在这里放一份镜像给 Xposed 侧读。
+# App 每次保存都会双写；这里在安装/升级时补一次，保证「刚装完、还没在 App 里点保存」时也能用。
+MIRROR_DIR="/data/local/tmp/CoreGate"
+mkdir -p "$MIRROR_DIR"
+chmod 0755 "$MIRROR_DIR"
+if [ -f "$CONFIG_DIR/spoof.json" ]; then
+    cp -f "$CONFIG_DIR/spoof.json" "$MIRROR_DIR/spoof.json"
+    chmod 0644 "$MIRROR_DIR/spoof.json"
+    ui_print "- 已同步老机型模拟配置到镜像目录"
+fi
+
 # 检测核心拓扑（仅提示用）
 detect_high_cluster() {
     local maxf=0 c f out=""
@@ -106,6 +122,7 @@ else
 fi
 
 ui_print "✅ 安装完成！"
-ui_print "  重启后打开 KernelSU 管理器 → 模块"
+ui_print "  重启后打开「核心门控」App 查看与调整全部设置"
+ui_print "  未装 App 时可在 KernelSU 模块页点「执行」查看状态"
 ui_print "  安装「核心门控」App 后在 App 内添加游戏包名"
 ui_print "  不安装 App 也能正常锁核（使用默认配置）"

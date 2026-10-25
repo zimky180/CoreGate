@@ -82,6 +82,39 @@ if [ -f "$FREEZE_STATE" ]; then
     done < "$FREEZE_STATE"
 fi
 
+ui_print "- 解冻墓碑进程..."
+# 与 service.sh 的 tomb_sweep 同源的四通道全量解冻。卸载时必须做，
+# 否则被 cgroup.freeze / SIGSTOP 冻住的第三方进程在模块移除后没人负责唤醒，
+# 表现为「某 App 一直点不开、要重启才恢复」。这里不依赖任何登记表，直接全机兜底。
+_n=0
+# 通道一：SIGSTOP 扫描
+for _d in /proc/[0-9]*; do
+    _pid=${_d#/proc/}
+    _st=$(awk '/^State:/{print $2; exit}' "$_d/status" 2>/dev/null)
+    case "$_st" in
+        T|t) kill -18 "$_pid" 2>/dev/null && _n=$((_n + 1)) ;;
+    esac
+done
+# 通道二：cgroup v1 freezer
+if [ -f /dev/freezer/frozen/cgroup.procs ] && [ -f /dev/freezer/thaw/cgroup.procs ]; then
+    while read -r _pid; do
+        [ -n "$_pid" ] && echo "$_pid" > /dev/freezer/thaw/cgroup.procs 2>/dev/null && _n=$((_n + 1))
+    done < /dev/freezer/frozen/cgroup.procs
+fi
+# 通道三：cgroup v2 freezer 根子树
+if [ -f /sys/fs/cgroup/frozen/cgroup.procs ] && [ -f /sys/fs/cgroup/cgroup.procs ]; then
+    while read -r _pid; do
+        [ -n "$_pid" ] && echo "$_pid" > /sys/fs/cgroup/cgroup.procs 2>/dev/null && _n=$((_n + 1))
+    done < /sys/fs/cgroup/frozen/cgroup.procs
+fi
+# 通道四：cgroup v2 应用节点，逐级写 0
+for _f in /sys/fs/cgroup/apps/uid_*/cgroup.freeze /sys/fs/cgroup/apps/uid_*/pid_*/cgroup.freeze; do
+    [ -f "$_f" ] || continue
+    [ "$(cat "$_f" 2>/dev/null)" = "1" ] || continue
+    echo 0 > "$_f" 2>/dev/null && _n=$((_n + 1))
+done
+ui_print "  · 已解冻 $_n 个进程/节点"
+
 ui_print "- 清理数据文件..."
 rm -rf "$CONFIG_DIR"
 # 新版日志写在模块本体目录的 log/ 子目录内，卸载时连同旧版残留一并清除

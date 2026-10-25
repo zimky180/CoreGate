@@ -9,9 +9,9 @@
 #   录屏/拍照 -> 检测到前台包名命中「录屏/相机清单」时，恢复全部核心
 #   离开游戏/录屏/相机 -> 重新封锁
 # ----------------------------------------------------------------
-# 配置：/data/adb/CoreGate/config.json（由 WebUI 写入，本脚本只读执行）
+# 配置：/data/adb/CoreGate/config.json（由 App 写入，本脚本只读执行）
 # 日志：/data/adb/modules/CoreGate/log/coregate.log（模块本体目录，卸载随模块一起清除）
-# 状态：/data/adb/CoreGate/state（供 WebUI 展示）
+# 状态：/data/adb/CoreGate/state（供 App 展示）
 # ================================================================
 
 MODDIR=${0%/*}
@@ -31,7 +31,7 @@ STATE_FILE="$CONFIG_DIR/state"
 PID_FILE="$CONFIG_DIR/daemon.pid"
 CORE_CTL_BACKUP="$CONFIG_DIR/corectl.state"
 # 手动离线的核心清单（一行一个 cpu 编号）
-# 为什么需要它：APK/WebUI 点击单个核心下线，如果只写 sysfs，
+# 为什么需要它：App 点击单个核心下线，如果只写 sysfs，
 # 守护进程下一轮 do_lock / do_unlock 会按 LOCK_LIST 直接覆盖掉用户的操作。
 # 所以必须把「用户手动关掉的核」持久化，让 do_lock 主动维持、do_unlock 故意跳过。
 MANUAL_FILE="$CONFIG_DIR/manual_off"
@@ -80,7 +80,7 @@ migrate_old_log() {
 mkdir -p "$CONFIG_DIR"
 echo $$ > "$PID_FILE" 2>/dev/null
 migrate_old_log
-# 配置缺失时用模块自带默认配置兜底（防止 WebUI 清理后无游戏列表导致只锁不解）
+# 配置缺失时用模块自带默认配置兜底（防止 App 清理后无游戏列表导致只锁不解）
 if [ ! -f "$CONFIG_FILE" ] && [ -f "$MODDIR/config.example.json" ]; then
     cp -f "$MODDIR/config.example.json" "$CONFIG_FILE" 2>/dev/null
     chmod 0644 "$CONFIG_FILE" 2>/dev/null
@@ -98,7 +98,7 @@ if [ ! -f "$PACKAGES_FILE" ]; then
     chmod 0644 "$PACKAGES_FILE" 2>/dev/null
 fi
 # 旧版 config.json 若还带 game_packages 大数组 → 剥离瘦身（包名已迁到 packages.txt），
-# 保持 config.json 为小文件，WebUI 可整读解析不截断
+# 保持 config.json 为小文件，App 可整读解析不截断
 if [ -f "$CONFIG_FILE" ] && grep -q '"game_packages"' "$CONFIG_FILE" 2>/dev/null; then
     sed -n '1,/"game_packages"/p' "$CONFIG_FILE" 2>/dev/null | sed '$d' | sed '$s/,$//' > "$CONFIG_FILE.tmp" 2>/dev/null
     echo '}' >> "$CONFIG_FILE.tmp"
@@ -257,7 +257,7 @@ restore_core_ctl() {
     rm -f "$CORE_CTL_BACKUP"
 }
 # 自动检测「最高频簇」= 需要封锁的大核（如 8 Gen 5 的 cpu6/cpu7）
-# 默认只锁 1 个（最稳，对应 Scene 实测可行的量），也可在 WebUI 手动指定
+# 默认只锁 1 个（最稳，对应 Scene 实测可行的量），也可在 App 手动指定
 detect_high() {
     total=0; cap=0; maxf=0
     for c in $(all_cpus); do
@@ -275,7 +275,7 @@ detect_high() {
         [ -n "$f" ] && [ "$f" -eq "$maxf" ] && echo "$c"
     done | sort -nr | head -n "$cap" | tr '\n' ' '
 }
-# ---------------- 手动离线核心（APK / WebUI 点击单核下线） ----------------
+# ---------------- 手动离线核心（App 点击单核下线） ----------------
 # 语义：manual_off 里记录的核，do_lock 会主动维持离线，do_unlock 会故意跳过不恢复。
 # 只有用户再次点击该核（或「恢复全部核心」/ 卸载 / 禁用）才会从清单里移除。
 manual_list() {
@@ -393,12 +393,13 @@ grp_self|作者自冻清单（C16.0.1.306 实测）|com.heytap.colorfulengine co
 
 # 取某个组的包名列表（组键不存在则输出空）
 freeze_group_pkgs() {
+    # 注意：本机 BusyBox ash 下 ${var%%|*} / ${var#*|} 处理 "|" 分隔符会失效
+    #      （| 被当成特殊字符，展开结果为空或原串），必须改用 cut 切分。
     echo "$FREEZE_TABLE" | while IFS= read -r _line; do
         [ -z "$_line" ] && continue
-        _k=${_line%%|*}
+        _k=$(echo "$_line" | cut -d"|" -f1)
         [ "$_k" = "$1" ] || continue
-        _rest=${_line#*|}
-        echo "${_rest#*|}"
+        echo "$_line" | cut -d"|" -f3-
     done
 }
 
@@ -464,68 +465,146 @@ freeze_get_mode() {  # $1=pkg
     echo "$_m"
 }
 
-# 停用单个包（已停用则跳过，静默）
+# 强杀某包的进程（对齐 Logd_Disabler_ColorOS16 的 kill_pkg_procs）
+#
+# 【为什么不换 pgrep -U】
+#   参考模块 v2.3.1 的回滚注释记录得很清楚：pgrep -U 在 Android 上不安全，
+#   某些实现会返回全部 PID，配合 kill -9 会误杀 system_server 导致黑屏。
+#   所以这里坚持 am force-stop + pkill -f 的两段式，且不在其中用 kill -9。
+kill_pkg_procs() {  # $1=pkg
+    am force-stop --user "$FREEZE_USER" "$1" >/dev/null 2>&1
+    _i=0
+    while [ "$_i" -lt 2 ]; do
+        pkill -f "$1" >/dev/null 2>&1
+        _i=$((_i + 1))
+        [ "$_i" -lt 2 ] && sleep 1
+    done
+    return 0
+}
+
+# 停用单个包
+#
+# 【本函数逻辑完全对齐 starlifezzz/Logd_Disabler_ColorOS16 的 disable_pkg】
+#   顺序：pkg_live_state → 基线登记 → 基线非 enabled 直接跳过（不接管用户既存状态）
+#         → pm disable-user 主通道 → 成功后强杀进程
+#         → 失败再 pm disable 兜底 + 强杀
+#         → 两种都失败只 return 1，绝不 uninstall
+#
+# 【必须删掉的旧分支】
+#   旧实现里有 `pm uninstall -k --user 0` 作为第二兜底。参考模块把它作为
+#   P0 事故命令族永久移除（与「手动卸载导致不开机」同类），本模块一律不用。
+#   原因：uninstall -k 会让包从用户列表消失，卸载模块后 install-existing 未必能救回来，
+#   而 disable-user 是可逆的，重启/恢复都能还原。
 freeze_off_pkg() {  # $1=pkg
     _p="$1"
+
+    # 1) 基线登记：首次接触时记下它「本来是什么状态」，之后永不覆盖
+    if ! freeze_is_recorded "$_p"; then
+        if pkg_is_disabled "$_p"; then
+            freeze_record_add "$_p" "disabled"
+            log "组件本已停用（用户的设置，保持原样）：$_p"
+            return 0
+        fi
+    fi
+
+    # 2) 已记录过（说明是本模块冻的），幂等返回
+    if freeze_is_recorded "$_p"; then
+        # 已记录但当前是启用态（比如用户手动打开了）→ 继续往下再冻一次
+        pkg_is_disabled "$_p" && return 0
+    fi
+
+    # 3) 包不存在就没什么可做的
     pkg_exists "$_p" || return 1
 
-    # 本模块已记录过 → 不重复操作
-    if freeze_is_recorded "$_p"; then
-        return 0
-    fi
+    # 4) 主通道：pm disable-user
+    _out=$(pm disable-user --user "$FREEZE_USER" "$_p" 2>&1)
+    case "$_out" in
+        *"new state: disabled"*|*Success*)
+            freeze_record_add "$_p" "enabled"
+            freeze_record_set_mode "$_p" "disable-user"
+            kill_pkg_procs "$_p"
+            log "组件冻结（disable-user）：$_p"
+            return 0
+            ;;
+    esac
 
-    # 用户本来就停用着它 → 只在记录里登记「原始=disabled」，不执行 pm，
-    # 这样将来恢复时也不会擅自把它打开。绝不夺取用户已有的设置。
-    if pkg_is_disabled "$_p"; then
-        freeze_record_add "$_p" "disabled"
-        log "组件本已停用（用户的设置，保持原样）：$_p"
-        return 0
-    fi
+    # 5) 兜底：pm disable
+    _out=$(pm disable --user "$FREEZE_USER" "$_p" 2>&1)
+    case "$_out" in
+        *"new state: disabled"*|*Success*)
+            freeze_record_add "$_p" "enabled"
+            freeze_record_set_mode "$_p" "disable"
+            kill_pkg_procs "$_p"
+            log "组件冻结（disable）：$_p"
+            return 0
+            ;;
+    esac
 
-    # 当前是启用态 → 记下原始 enabled，再冻结
-    # 冻结方式与 Scene 一致：优先 pm suspend（挂起），失败才退回 pm disable。
-    #   suspend：进程被挂起、组件不响应、但不改动包的安装/启用状态，
-    #            系统里表现为「已冻结」，不会像 disable 那样在卸载界面被当成可卸残留。
-    #   disable：兜底。个别系统包 suspend 会被拒绝（返回非 0），此时仍用 disable。
-    # 原始状态记录为 enabled / disabled / suspended 三种之一，恢复时按原样还原。
-    if pm suspend --user "$FREEZE_USER" --package "$FREEZE_ISSUER" "$_p" >/dev/null 2>&1; then
+    # 6) 两种通道都失败：只做进程级强杀，记录为 force-stop，绝不卸载
+    if kill_pkg_procs "$_p"; then
         freeze_record_add "$_p" "enabled"
-        freeze_record_set_mode "$_p" "suspend"
-        log "组件冻结：$_p"
-        return 0
-    fi
-    if pm disable --user "$FREEZE_USER" "$_p" >/dev/null 2>&1; then
-        freeze_record_add "$_p" "enabled"
-        freeze_record_set_mode "$_p" "disable"
-        log "组件停用（suspend 不支持，已降级 disable）：$_p"
+        freeze_record_set_mode "$_p" "force-stop"
+        log "组件冻结（仅进程级 force-stop）：$_p"
         return 0
     fi
     return 1
 }
 
-# 启用单个包（仅当确实被本模块记录过才动它，绝不碰用户的其它设置）
+# 启用单个包
+#
+# 【逻辑对齐参考模块 enable_pkg】
+#   无改动记录 → 保持现状
+#   基线≠enabled（用户自己停用的）→ 不恢复
+#   当前已 enabled → 跳过；当前 missing（被用户卸载）→ 不复活
+#   pm enable --user 0 → 失败再 pm enable 兜底
+#   绝不 install-existing 复活用户自己卸载的包
 freeze_on_pkg() {  # $1=pkg
     _p="$1"
+
+    # 没有任何改动记录 → 不是本模块冻的，保持现状
     freeze_is_recorded "$_p" || return 1
 
-    # 按原始状态还原：原本就是 disabled 的，继续保持停用，不做任何处理
+    # 原本就是 disabled 的（用户自己的设置）→ 只清记录，不打开
     if [ "$(freeze_orig_state "$_p")" = "disabled" ]; then
         freeze_record_del "$_p"
         log "组件原本即为停用态，无需恢复：$_p"
         return 0
     fi
 
-    # 按记录的冻结方式反向还原，避免「suspend 过却只 enable」留下挂起孤儿状态。
-    # 两种方式都试一遍是刻意的：既覆盖记录缺失的旧版本遗留，也覆盖
-    # 上一轮 suspend 成功但记录写失败的极端情况。unsuspend 对未挂起的包是空操作。
-    _ok=0
-    pm unsuspend --user "$FREEZE_USER" --package "$FREEZE_ISSUER" "$_p" >/dev/null 2>&1 && _ok=1
-    pm enable --user "$FREEZE_USER" "$_p" >/dev/null 2>&1 && _ok=1
-    if [ "$_ok" = "1" ]; then
+    # 已经不在了（用户自己卸载）→ 不复活，只清记录
+    if ! pkg_exists "$_p"; then
         freeze_record_del "$_p"
-        log "组件恢复：$_p"
+        log "组件已不存在，不复活：$_p"
         return 0
     fi
+
+    # 本身就已是启用态 → 清记录即可
+    if ! pkg_is_disabled "$_p"; then
+        freeze_record_del "$_p"
+        return 0
+    fi
+
+    # 主通道：pm enable --user
+    _out=$(pm enable --user "$FREEZE_USER" "$_p" 2>&1)
+    case "$_out" in
+        *"new state: enabled"*|*Success*)
+            freeze_record_del "$_p"
+            log "组件恢复（enable）：$_p"
+            return 0
+            ;;
+    esac
+
+    # 兜底：不带 --user 的 pm enable
+    _out=$(pm enable "$_p" 2>&1)
+    case "$_out" in
+        *"new state: enabled"*|*Success*)
+            freeze_record_del "$_p"
+            log "组件恢复（enable 兜底）：$_p"
+            return 0
+            ;;
+    esac
+
+    # 刻意不调用 pm install-existing —— 绝不复活用户自己卸载的包
     return 1
 }
 
@@ -542,10 +621,10 @@ freeze_pkg_used_by_other() {  # $1=pkg  $2=当前组键（跳过自身）
     _needle="$1"; _self_key="$2"
     echo "$FREEZE_TABLE" | while IFS= read -r _line; do
         [ -z "$_line" ] && continue
-        _k=${_line%%|*}
+        _k=$(printf %s "$_line" | cut -d"|" -f1)
         [ "$_k" = "$_self_key" ] && continue
-        _rest=${_line#*|}
-        _pkgs=${_rest#*|}
+        _pkgs=$(printf %s "$_line" | cut -d"|" -f3-)
+        :
         case " $_pkgs " in
             *" $_needle "*) freeze_group_on "$_k" && echo "$_k" ;;
         esac
@@ -564,9 +643,9 @@ freeze_pkg_used_by_other() {  # $1=pkg  $2=当前组键（跳过自身）
 freeze_sync() {
     echo "$FREEZE_TABLE" | while IFS= read -r _line; do
         [ -z "$_line" ] && continue
-        _k=${_line%%|*}
-        _rest=${_line#*|}
-        _pkgs=${_rest#*|}
+        _k=$(printf %s "$_line" | cut -d"|" -f1)
+        _pkgs=$(printf %s "$_line" | cut -d"|" -f3-)
+        :
         if freeze_group_on "$_k"; then
             for _p in $_pkgs; do
                 freeze_off_pkg "$_p"
@@ -591,10 +670,11 @@ freeze_restore_all() {
     while IFS='	' read -r _p _st _md; do
         [ -z "$_p" ] && continue
         if [ "$_st" = "enabled" ]; then
-            # 两种解冻方式都走一遍：不管当初是 suspend 还是 disable 都能还原，
-            # 各自失败的调用是空操作，不会造成副作用。
-            pm unsuspend --user "$FREEZE_USER" --package "$FREEZE_ISSUER" "$_p" >/dev/null 2>&1
+            # 三种还原方式都走一遍：不管当初是 disable-user / uninstall / force-stop 都能还原，
+            # 各自失败的调用是空操作，不会造成副作用。同样不带 --package。
             pm enable --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
+            pm install-existing --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
+            pm unsuspend --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
         fi
     done < "$FREEZE_STATE"
     rm -f "$FREEZE_STATE" 2>/dev/null
@@ -603,18 +683,51 @@ freeze_restore_all() {
 
 # 状态查询：输出当前实际被停用/挂起的包（不管是否本模块所为），供状态面板展示
 # 每行格式：包名<TAB>方式（disabled / suspended）
+#
+# 【历史坑，务必别再踩】
+#   旧实现尝试过三个命令取挂起列表：`pm suspend list packages`、
+#   `pm get-suspended-packages`、`pm list packages -s`。
+#   实测三者全都不能用：
+#     · pm suspend list packages → IllegalArgumentException: Unknown target package: list
+#     · pm get-suspended-packages → Unknown command
+#     · pm list packages -s       → -s 的语义是「列出系统包(shared/system)」，
+#                                   跟挂起毫无关系，却返回了一整屏系统包名，
+#                                   旧代码把它当挂起列表输出，于是面板上
+#                                   所有系统包都显示成「已挂起」——这就是误报的来源。
+#   -s 这个错选最隐蔽：它退出码为 0、输出非空，看起来「成功」了。
+#
+# 【现行做法】挂起状态以 dumpsys 里每个包的 user 状态行为准，逐包解析：
+#     User 0: ... suspended=true ...
+#   dumpsys package 一次吐全部包，用 awk 在 awk 内维护「当前包名」上下文即可，
+#   不需要为每个包单独跑一次 dumpsys（那要几百次进程启动，太慢）。
+#   停用状态仍用 pm list packages -d（这个参数语义正确，实测可靠）。
 freeze_status_report() {
-    {
-        pm list packages -d 2>/dev/null | sed 's/^package://' | sed 's/$/\tdisabled/'
-        # suspend 列表在不同 ROM 上命令名有差异，逐个尝试，哪个能用用哪个
-        for _c in "suspend list packages" "get-suspended-packages" "list packages -s"; do
-            _r=$(pm $_c 2>/dev/null)
-            if [ -n "$_r" ]; then
-                echo "$_r" | sed 's/^package://' | sed 's/$/\tsuspended/'
-                break
-            fi
-        done
-    } | sort -u
+    # 1) 停用列表：pm list packages -d 语义正确，直接采信
+    pm list packages -d 2>/dev/null | sed 's/^package://' | sed 's/$/\tdisabled/'
+    # 2) 挂起列表：从 dumpsys package 里按包名上下文找 suspended=true
+    #    只认 user 0（FREEZE_USER 默认 0），与冻结时保持同一用户口径
+    dumpsys package 2>/dev/null | awk -v u="User $FREEZE_USER:" '
+        /^[[:space:]]*Package \[/ {
+            # 形如 "  Package [com.foo.bar] (abc123):"
+            pkg = $0
+            sub(/^[[:space:]]*Package \[/, "", pkg)
+            sub(/\].*$/, "", pkg)
+            next
+        }
+        {
+            # 目标用户状态行形如：
+            #     "    User 0: ceDataInode=... installed=true hidden=false suspended=false ..."
+            # 前面有 4 个空格缩进，所以不能要求行首匹配，必须先剥掉前导空白。
+            if (pkg != "" && index($0, "suspended=true") > 0) {
+                line = $0
+                sub(/^[[:space:]]+/, "", line)
+                if (index(line, u) == 1) {
+                    print pkg "\tsuspended"
+                    pkg = ""
+                }
+            }
+        }
+    '
 }
 
 
@@ -957,7 +1070,15 @@ restore_all() {
 }
 
 TRAP_DONE=0
+# 【关键】只有守护主循环（run）才需要「退出即全量还原」。
+# 命令行单次调用（--freeze-add / --set-freeze / --freeze-sync / --freeze-status ...）
+# 若也触发 EXIT trap，就会执行 restore_all → freeze_restore_all
+# → rm -f "$FREEZE_STATE"，把刚写好的冻结记录连同刚冻结的包一起抹掉，
+# 表现为「冻结返回成功，但 freeze.state 不存在 / 开关立刻失效」。
+# 这类假象极难排查，因此 trap 默认不装，进 run() 时才 TRAP_ARMED=1。
+TRAP_ARMED=0
 cleanup_on_exit() {
+    [ "$TRAP_ARMED" = "1" ] || return 0
     [ "$TRAP_DONE" = "1" ] && exit 0
     TRAP_DONE=1
     restore_all
@@ -968,6 +1089,8 @@ cleanup_on_exit() {
 trap cleanup_on_exit TERM INT EXIT
 
 run() {
+    # 进入守护主循环：此后退出（TERM/INT/EXIT）才需要全量还原，武装 trap。
+    TRAP_ARMED=1
     state=""; pkg=""; want_lock=""; last_pkg=""; lock_logged=0; ss=""; it2=0; last_ss=""
     prev_unlocked=0; oc_now=""
 
@@ -992,7 +1115,7 @@ run() {
     # 清理历史版本遗留的 giveup_* 计数文件
     rm -f "$CONFIG_DIR"/giveup_* 2>/dev/null
 
-    # 启动即确定封锁名单（此后每轮循环都会刷新，WebUI 改配置即时生效）
+    # 启动即确定封锁名单（此后每轮循环都会刷新，App 改配置即时生效）
     AUTO_COUNT=$(cfg_int auto_lock_count 1)
     DISABLE_CC=$(cfg_bool disable_core_ctl false)
     LOCK_LIST=$(cfg_val lock_cores auto)
@@ -1038,7 +1161,7 @@ run() {
         fi
 
         ENABLED=$(cfg_bool enabled true)
-        # 刷新封锁名单（支持 WebUI 运行时改核心）
+        # 刷新封锁名单（支持 App 运行时改核心）
         AUTO_COUNT=$(cfg_int auto_lock_count 1)
         DISABLE_CC=$(cfg_bool disable_core_ctl false)
         LOCK_LIST=$(cfg_val lock_cores auto)
@@ -1271,19 +1394,74 @@ case "$1" in
     --unlock-once)
         unlock_once
         ;;
+    --core-off)
+        # App 点单个核心 = 要求它一直保持离线。
+        # 只写清单 + 立刻下一次线，剩下的交给主循环维持：
+        # do_lock() 每轮都会把 manual_list 里的核按回离线，do_unlock() 则跳过它们，
+        # 这样即使用户切到游戏（触发自动恢复）也不会被系统悄悄拉回来。
+        shift
+        _c="$1"
+        case "$_c" in ''|*[!0-9]*) echo "BADCPU"; exit 1;; esac
+        if manual_add "$_c"; then
+            if [ -f "/sys/devices/system/cpu/cpu$_c/online" ]; then
+                echo 0 > "/sys/devices/system/cpu/cpu$_c/online" 2>/dev/null
+            fi
+            if cpu_online "$_c"; then echo "FAIL"; else echo "OK"; fi
+        else
+            echo "FAIL"
+        fi
+        ;;
+    --core-on)
+        # App 点同一个核心 = 撤销手动离线，交回自动策略。
+        shift
+        _c="$1"
+        case "$_c" in ''|*[!0-9]*) echo "BADCPU"; exit 1;; esac
+        manual_del "$_c"
+        # 立刻拉回来，不等下一轮循环（用户点了就该马上看到变化）
+        if [ -f "/sys/devices/system/cpu/cpu$_c/online" ]; then
+            [ "$_c" = "0" ] || echo 1 > "/sys/devices/system/cpu/cpu$_c/online" 2>/dev/null
+        fi
+        if cpu_online "$_c"; then echo "OK"; else echo "FAIL"; fi
+        ;;
+    --core-clear)
+        # 「恢复全部核心」按钮：清空手动清单，再走一遍标准恢复。
+        manual_clear
+        unlock_once
+        echo "OK"
+        ;;
+    --core-list)
+        # 只读：输出当前手动离线的核号，空格分隔，便于 App 与在线状态对照。
+        manual_list | tr '\n' ' '
+        echo ""
+        ;;
     --freeze-status)
-        # 只读查询：给 APK / WebUI 状态面板用。输出分两段，便于前端一眼分清
+        # 只读查询：给 App 状态面板用。输出分两段，便于前端一眼分清
         #「本模块冻结了什么」和「系统当前实际是什么状态」（后者才是是否真生效的证据）。
         #
         # [applied] 本模块记录在案的冻结项：包名<TAB>方式
         # [actual]  系统当前真实的停用/挂起列表：包名<TAB>方式（含非本模块所为）
         echo "[applied]"
-        if [ -f "$FREEZE_STATE" ]; then
+        if [ -f "$FREEZE_STATE" ] && [ -s "$FREEZE_STATE" ]; then
             while IFS='	' read -r _p _st _md; do
                 [ -z "$_p" ] && continue
                 [ -z "$_md" ] && _md="disable"
                 printf '%s\t%s\n' "$_p" "$_md"
             done < "$FREEZE_STATE"
+        else
+            # 记录文件不存在或为空（freeze_restore_all 结尾会 rm 掉它，模块升级也可能丢）：
+            # 用「组开关为 on 且组内包在系统里确实被停用/挂起」反推，
+            # 免得界面把已经冻上的包报成「没有冻结」。只补真实出现在 actual 里的包。
+            _fb_actual=$(freeze_status_report 2>/dev/null | cut -f1)
+            echo "$FREEZE_TABLE" | while IFS= read -r _fb_line; do
+                [ -z "$_fb_line" ] && continue
+                _fb_key=$(printf %s "$_fb_line" | cut -d"|" -f1)
+                freeze_group_on "$_fb_key" || continue
+                for _fb_p in $(freeze_group_pkgs "$_fb_key"); do
+                    [ -z "$_fb_p" ] && continue
+                    echo "$_fb_actual" | grep -qxF "$_fb_p" || continue
+                    printf "%s\t%s\n" "$_fb_p" "disable"
+                done
+            done
         fi
         echo "[actual]"
         freeze_status_report
@@ -1291,7 +1469,7 @@ case "$1" in
         # 各组开关当前值，供界面回显
         echo "$FREEZE_TABLE" | while IFS= read -r _line; do
             [ -z "$_line" ] && continue
-            _k=${_line%%|*}
+            _k=$(printf %s "$_line" | cut -d"|" -f1)
             if freeze_group_on "$_k"; then echo "$_k	on"; else echo "$_k	off"; fi
         done
         exit 0
@@ -1302,14 +1480,34 @@ case "$1" in
         _k="$2"
         _v="$3"
         if [ -z "$_k" ]; then echo "SET_FREEZE_FAIL: 缺组键"; exit 1; fi
+        # 组键归一化：APK 侧 FreezeData.GROUPS 的 key 是短名（log/media/diag...），
+        # 而 config 里的键与 FREEZE_TABLE 第一列都是 grp_ 前缀（freeze_grp_log）。
+        # 若不补前缀，短名会被写成 freeze_diag 这种孤儿键：
+        #     · freeze_group_on 只认 freeze_grp_diag → 开关永远不生效
+        #     · 而且返回 SET_FREEZE_OK，界面显示成功、实际什么都没冻
+        # 这里两种写法都接受，统一归一到 grp_ 前缀。
+        case "$_k" in
+            grp_*) ;;
+            *) _k="grp_$_k" ;;
+        esac
+        # 校验组键真实存在，避免界面传错键名时静默堆积垃圾键
+        _kknown=""
+        _kchk=$(echo "$FREEZE_TABLE" | while IFS= read -r _kl; do
+            [ -z "$_kl" ] && continue
+            [ "$(printf %s "$_kl" | cut -d"|" -f1)" = "$_k" ] && echo yes && break
+        done)
+        [ "$_kchk" = "yes" ] && _kknown=1
+        if [ -z "$_kknown" ]; then
+            echo "SET_FREEZE_FAIL: 未知组键 $_k"
+            exit 1
+        fi
         case "$_v" in
             true|false) ;;
             *) echo "SET_FREEZE_FAIL: 值须为 true 或 false"; exit 1 ;;
         esac
         cfg_set_bool "freeze_$_k" "$_v" || { echo "SET_FREEZE_FAIL: 写配置失败"; exit 1; }
-        # 组被打开立刻同步一次，用户点完就能看到效果，不用等下个轮询周期
-        [ "$_v" = "true" ] && freeze_sync >/dev/null 2>&1
-        [ "$_v" = "false" ] && freeze_sync >/dev/null 2>&1
+        # 组被打开/关闭立刻同步一次，用户点完就能看到效果，不用等下个轮询周期
+        freeze_sync >/dev/null 2>&1
         echo "SET_FREEZE_OK: $_k=$_v"
         exit 0
         ;;
@@ -1326,17 +1524,30 @@ case "$1" in
         ;;
     --freeze-del)
         # 单独解冻某个包
+        #
+        # 【为什么要再回读一次真实状态】(v2.2.1)
+        #   旧实现是 freeze_on_pkg 失败后无脑补一次 unsuspend+enable，
+        #   然后不管结果如何都 echo FREEZE_DEL_OK。于是界面永远显示「已解冻」，
+        #   哪怕 pm 因为系统策略彻底拒绝执行 —— 这正是用户报的「点了没反应」。
+        #   现在：清掉孤儿挂起态之后必须回读 pkg_is_disabled，只有真的不再是
+        #   停用态才报 OK；仍是停用态就报 FAIL 并给出当前实测状态，让界面如实提示。
         _p="$2"
         if [ -z "$_p" ]; then echo "FREEZE_DEL_FAIL: 缺包名"; exit 1; fi
         if freeze_on_pkg "$_p"; then
             echo "FREEZE_DEL_OK: $_p"
             exit 0
         fi
-        # 没被记录过也允许尝试一次解冻，清掉可能存在的孤儿挂起态
-        pm unsuspend --user "$FREEZE_USER" --package "$FREEZE_ISSUER" "$_p" >/dev/null 2>&1
+        # 没被记录过（或记录已清但系统仍挂起）→ 尝试清掉孤儿挂起态
+        pm unsuspend --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
         pm enable --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
-        echo "FREEZE_DEL_OK: $_p"
-        exit 0
+        # 回读：只有确实不再是停用态才算成功
+        if ! pkg_is_disabled "$_p"; then
+            freeze_record_del "$_p"
+            echo "FREEZE_DEL_OK: $_p"
+            exit 0
+        fi
+        echo "FREEZE_DEL_FAIL: $_p (仍处于停用态)"
+        exit 1
         ;;
     --freeze-sync)
         # 按当前 config.json 立即同步一次组开关状态（不进入守护循环）
