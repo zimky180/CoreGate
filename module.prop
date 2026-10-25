@@ -1,7 +1,7 @@
 id=CoreGate
 name=核心门控 2.0（大核封锁·游戏自动恢复）
-version=v2.2.3
-versionCode=223
+version=v2.2.4
+versionCode=224
 author=zimky
-description=日常使用自动封锁高频大核并可选限频降低功耗，检测到游戏（目标包名）自动恢复全部核心；支持原生 App 可视化配置、锁核建议、息屏自动锁核、录屏/相机自动恢复、可选组件停用（六组默认关闭）、一键恢复原始状态/删除全部残留。完全可逆零残留。作者：zimky。v2.2.0：配置入口统一为原生 App（四页导航），移除 KernelSU WebUI；新增可选组件停用（运行日志/影音附加/云端备份/系统诊断/广告推送/作者自冻清单，六组默认全关）；APK 与模块经 /data/adb/CoreGate/config.json 通信。
+description=日常使用自动封锁高频大核并可选限频降低功耗，检测到游戏（目标包名）自动恢复全部核心；支持原生 App 可视化配置、锁核建议、息屏自动锁核、录屏/相机自动恢复、可选组件停用（六组默认关闭）、一键恢复原始状态/删除全部残留。完全可逆零残留。作者：zimky。v2.2.0：配置入口统一为原生 App（四页导航），移除 KernelSU WebUI；新增可选组件停用（运行日志/影音附加/云端备份/系统诊断/广告推送/作者自冻清单，六组默认全关）；APK 与模块经 /data/adb/CoreGate/config.json 通信。v2.2.4：限频阈值可自定义——小核/大核/GPU 频率与 GPU 功耗档位均由 App 滑杆按本机真实档位表选取，存于 config.json 的 cap_little_mhz / cap_big_mhz / cap_gpu_mhz / cap_gpu_pwrlevel，模块每轮循环重读，改完即时生效；未自定义时行为与旧版完全一致。
 updateJson=https://raw.githubusercontent.com/zimky180/CoreGate/main/update.json

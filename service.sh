@@ -782,11 +782,32 @@ do_unlock() {
 #   5) GPU 仅压 max_gpuclk / max_pwrlevel（省电天花板）与 devfreq，
 #      写入频率需与 CPU 一样做 +800 对齐，否则精确值会被内核直接拒绝。
 FREQ_CAPPED=0
-# 锁定的安全上限（用户不可调）
+# 锁定的安全上限（可在 App「限频目标档位」里自定义，存于 config.json）
+# 优先级：config.json 的 cap_* 字段 > 这里的内置默认值。
+# 之所以保留内置默认：老版本 config.json 没有这几个键，cfg_int 会回退到下面的兜底值，
+# 保证「升级模块但没重新保存配置」时限频行为与旧版完全一致。
 CAP_LITTLE_MHZ=2266      # policy0（小核簇）上限
 CAP_BIG_MHZ=1651         # policy6（大核簇）上限
 CAP_GPU_MHZ=500          # GPU 上限
 CAP_GPU_PWRLEVEL=13      # GPU 最高功耗档位
+# 从 config 读取自定义值；0 或非法值 = 未自定义，保留上面的默认
+freq_cap_load_config() {
+    _v=$(cfg_int cap_little_mhz 0)
+    [ "$_v" -gt 0 ] 2>/dev/null && CAP_LITTLE_MHZ=$_v
+    _v=$(cfg_int cap_big_mhz 0)
+    [ "$_v" -gt 0 ] 2>/dev/null && CAP_BIG_MHZ=$_v
+    _v=$(cfg_int cap_gpu_mhz 0)
+    [ "$_v" -gt 0 ] 2>/dev/null && CAP_GPU_MHZ=$_v
+    _v=$(cfg_int cap_gpu_pwrlevel -1)
+    # pwrlevel 允许 0（0 就是最高性能档，是合法值），因此不能像上面三项那样用 >0 过滤。
+    # App 用 -1 当「没设置过」的哨兵，这里只采纳 >=0 且 < num_pwrlevels 的值。
+    if [ -n "$_v" ] && [ "$_v" -ge 0 ] 2>/dev/null; then
+        _num=$(cat "$GPU_DIR/num_pwrlevels" 2>/dev/null)
+        if [ -z "$_num" ] || [ "$_v" -lt "$_num" ] 2>/dev/null; then
+            CAP_GPU_PWRLEVEL=$_v
+        fi
+    fi
+}
 GPU_RESTORE_MHZ=1225000000   # 恢复时 GPU 硬件上限
 P0_DIR="/sys/devices/system/cpu/cpufreq/policy0"
 P6_DIR="/sys/devices/system/cpu/cpufreq/policy6"
@@ -899,6 +920,9 @@ gpu_restore_write() {
 
 apply_freq_cap() {
     [ "$LIMIT_FREQ" = "true" ] || return 0
+    # 每轮循环都重新读一次阈值：App 里改完保存立即生效，无需重启模块。
+    # 未配置（0 / 缺键）时该函数保持上面内置默认不变，行为与旧版一致。
+    freq_cap_load_config
     # 首次开启限频：记录开启前的真实上限，供关闭时精确还原（第2条需求）
     freq_snapshot_save
     cap_cluster "$P0_DIR" "$CAP_LITTLE_MHZ"
