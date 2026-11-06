@@ -80,19 +80,14 @@ if [ ! -f "$CONFIG_DIR/capture.txt" ]; then
     chmod 0644 "$CONFIG_DIR/capture.txt"
 fi
 
-# 老机型模拟配置的镜像副本
-#
-# 为什么要镜像：/data/adb 权限是 700，被注入进抖音的进程（普通 uid）连目录都进不去，
-# 读不到 /data/adb/CoreGate/spoof.json，于是 hook 永远不生效。
-# /data/local/tmp 是 drwxrwx--x，普通进程能进能读，所以在这里放一份镜像给 Xposed 侧读。
-# App 每次保存都会双写；这里在安装/升级时补一次，保证「刚装完、还没在 App 里点保存」时也能用。
-MIRROR_DIR="/data/local/tmp/CoreGate"
-mkdir -p "$MIRROR_DIR"
-chmod 0755 "$MIRROR_DIR"
-if [ -f "$CONFIG_DIR/spoof.json" ]; then
-    cp -f "$CONFIG_DIR/spoof.json" "$MIRROR_DIR/spoof.json"
-    chmod 0644 "$MIRROR_DIR/spoof.json"
-    ui_print "- 已同步老机型模拟配置到镜像目录"
+# 升级时按当前字段模板迁移；保留有效设置，不在开机时重置配置。
+if [ -f "$MODPATH/migrate-config.sh" ]; then
+    . "$MODPATH/migrate-config.sh"
+    if cg_migrate_config "$CONFIG_DIR/config.json" "$MODPATH/config.example.json"; then
+        ui_print "- 配置迁移完成：保留有效设置并清理旧字段"
+    else
+        ui_print "! 配置迁移未完成，保留原配置"
+    fi
 fi
 
 # 检测核心拓扑（仅提示用）

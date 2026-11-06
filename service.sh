@@ -33,7 +33,7 @@ CORE_CTL_BACKUP="$CONFIG_DIR/corectl.state"
 # 手动离线的核心清单（一行一个 cpu 编号）
 # 为什么需要它：App 点击单个核心下线，如果只写 sysfs，
 # 守护进程下一轮 do_lock / do_unlock 会按 LOCK_LIST 直接覆盖掉用户的操作。
-# 所以必须把「用户手动关掉的核」持久化，让 do_lock 主动维持、do_unlock 故意跳过。
+# 所以必须把「用户手动关掉的核」持久化，让 do_lock 主动维持、do_unlock 临时恢复。
 MANUAL_FILE="$CONFIG_DIR/manual_off"
 
 # 录屏 / 相机内置默认包名（capture.txt 不存在或为空时兜底）
@@ -78,7 +78,6 @@ migrate_old_log() {
 }
 
 mkdir -p "$CONFIG_DIR"
-echo $$ > "$PID_FILE" 2>/dev/null
 migrate_old_log
 # 配置缺失时用模块自带默认配置兜底（防止 App 清理后无游戏列表导致只锁不解）
 if [ ! -f "$CONFIG_FILE" ] && [ -f "$MODDIR/config.example.json" ]; then
@@ -97,15 +96,7 @@ if [ ! -f "$PACKAGES_FILE" ]; then
     fi
     chmod 0644 "$PACKAGES_FILE" 2>/dev/null
 fi
-# 旧版 config.json 若还带 game_packages 大数组 → 剥离瘦身（包名已迁到 packages.txt），
-# 保持 config.json 为小文件，App 可整读解析不截断
-if [ -f "$CONFIG_FILE" ] && grep -q '"game_packages"' "$CONFIG_FILE" 2>/dev/null; then
-    sed -n '1,/"game_packages"/p' "$CONFIG_FILE" 2>/dev/null | sed '$d' | sed '$s/,$//' > "$CONFIG_FILE.tmp" 2>/dev/null
-    echo '}' >> "$CONFIG_FILE.tmp"
-    [ -s "$CONFIG_FILE.tmp" ] && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE" && chmod 0644 "$CONFIG_FILE"
-    rm -f "$CONFIG_FILE.tmp"
-    log "已剥离旧版 game_packages 数组，config.json 已瘦身"
-fi
+# 保留旧版 game_packages 字段：按行截断 JSON 会丢失后续设置或破坏单行配置。
 
 # ---------------- 配置读取（config.json 每字段一行） ----------------
 cfg_val() {  # 字符串
@@ -122,7 +113,7 @@ cfg_bool() {  # 布尔
 }
 cfg_int() {  # 数字
     k="$1"; d="$2"
-    v=$(sed -n "s/.*\"$k\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$CONFIG_FILE" 2>/dev/null | head -1)
+    v=$(sed -nE "s/.*\"$k\"[[:space:]]*:[[:space:]]*(-?[0-9]+)[[:space:]]*([,}].*)?$/\1/p" "$CONFIG_FILE" 2>/dev/null | head -1)
     [ -n "$v" ] && echo "$v" || echo "$d"
 }
 
@@ -171,44 +162,25 @@ cfg_set_bool() {  # $1=键 $2=true|false
         return 1
     fi
 
-    # 第二步：键不存在，追加到最后一个 } 之前
+    # 插入根对象最后的闭合括号，兼容单行、空对象和末尾空行。
     rm -f "$CONFIG_FILE.tmp"
     awk -v k="$_k" -v v="$_v" '
-        function q(str) { return "\"" str "\"" }
-        { lines[NR] = $0; n = NR }
+        { text = text $0 "\n" }
         END {
-            # 先找出最后一行是不是闭合括号
-            if (n >= 1 && lines[n] ~ /^[ \t]*}[ \t]*$/) {
-                # 找最后一个非空行，给它补逗号
-                last = 0
-                for (j = n - 1; j >= 1; j--) {
-                    if (lines[j] ~ /[^ \t]/) { last = j; break }
-                }
-                if (last > 0 && lines[last] !~ /,[ \t]*$/) lines[last] = lines[last] ","
-            } else {
-                last = -1
-            }
-            # 统一输出：前面所有行 -> 新键 -> 闭合括号
-            for (i = 1; i <= n; i++) {
-                if (last >= 0 && i == n) {
-                    print "  " q(k) ": " v
-                }
-                print lines[i]
-            }
-            if (last < 0) {
-                # 文件末尾没有闭合括号（异常情况），直接补一行
-                print "  " q(k) ": " v
-            }
+            sub(/[ \t\r\n]+$/, "", text)
+            if (text !~ /^ *\{/ || text !~ /} *$/) exit 1
+            sub(/} *$/, "", text)
+            sub(/[ \t\r\n]+$/, "", text)
+            if (text !~ /\{$/) text = text ","
+            printf "%s\n  \"%s\": %s\n}\n", text, k, v
         }
-    ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" 2>/dev/null
+    ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" 2>/dev/null || {
+        rm -f "$CONFIG_FILE.tmp"; return 1;
+    }
+    [ -s "$CONFIG_FILE.tmp" ] || return 1
+    mv "$CONFIG_FILE.tmp" "$CONFIG_FILE" || return 1
+    chmod 0644 "$CONFIG_FILE" 2>/dev/null
 
-    if [ -s "$CONFIG_FILE.tmp" ]; then
-        mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        chmod 0644 "$CONFIG_FILE" 2>/dev/null
-        return 0
-    fi
-    rm -f "$CONFIG_FILE.tmp"
-    return 1
 }
 
 # ---------------- 核心工具 ----------------
@@ -259,25 +231,46 @@ restore_core_ctl() {
 # 自动检测「最高频簇」= 需要封锁的大核（如 8 Gen 5 的 cpu6/cpu7）
 # 默认只锁 1 个（最稳，对应 Scene 实测可行的量），也可在 App 手动指定
 detect_high() {
-    total=0; cap=0; maxf=0
-    for c in $(all_cpus); do
-        total=$((total+1))
-        f=$(cat "/sys/devices/system/cpu/cpu$c/cpufreq/cpuinfo_max_freq" 2>/dev/null)
-        [ -n "$f" ] && [ "$f" -gt "$maxf" ] && maxf="$f"
+    _cap=${AUTO_COUNT:-1}
+    case "$_cap" in ''|*[!0-9]*) _cap=1;; esac
+    [ "$_cap" -lt 1 ] && _cap=1
+    [ "$_cap" -gt 4 ] && _cap=4
+    _maxf=0; _high=""
+    for _policy in /sys/devices/system/cpu/cpufreq/policy*; do
+        [ -d "$_policy" ] || continue
+        _freq=$(cat "$_policy/cpuinfo_max_freq" 2>/dev/null)
+        _members=$(cat "$_policy/related_cpus" 2>/dev/null)
+        case "$_freq" in ''|*[!0-9]*) continue;; esac
+        [ -n "$_members" ] || continue
+        if [ "$_freq" -gt "$_maxf" ]; then
+            _maxf=$_freq; _high="$_members"
+        elif [ "$_freq" -eq "$_maxf" ]; then
+            _high="$_high $_members"
+        fi
     done
-    case "$AUTO_COUNT" in
-        ''|*[!0-9]*) AUTO_COUNT=1;;
-    esac
-    cap=$AUTO_COUNT; [ "$cap" -lt 1 ] && cap=1; [ "$cap" -gt 4 ] && cap=4
-    [ "$maxf" -eq 0 ] && { echo ""; return; }
-    for c in $(all_cpus); do
-        f=$(cat "/sys/devices/system/cpu/cpu$c/cpufreq/cpuinfo_max_freq" 2>/dev/null)
-        [ -n "$f" ] && [ "$f" -eq "$maxf" ] && echo "$c"
-    done | sort -nr | head -n "$cap" | tr '\n' ' '
+    # 无 policy 拓扑时只使用首次检测结果，避免离线后把次高频小核当成大核。
+    if [ -z "$_high" ]; then
+        if [ -s "$CONFIG_DIR/high_cores" ]; then
+            _high=$(cat "$CONFIG_DIR/high_cores")
+        else
+            for _cpu in $(all_cpus); do
+                _freq=$(cat "/sys/devices/system/cpu/cpu$_cpu/cpufreq/cpuinfo_max_freq" 2>/dev/null)
+                case "$_freq" in ''|*[!0-9]*) continue;; esac
+                if [ "$_freq" -gt "$_maxf" ]; then
+                    _maxf=$_freq; _high="$_cpu"
+                elif [ "$_freq" -eq "$_maxf" ]; then
+                    _high="$_high $_cpu"
+                fi
+            done
+            [ -n "$_high" ] && printf '%s\n' "$_high" > "$CONFIG_DIR/high_cores"
+        fi
+    fi
+    [ -n "$_high" ] || _high=$(all_cpus | tail -n 1)
+    printf '%s\n' $_high | grep -E '^[0-9]+$' | grep -v '^0$' | sort -nru | head -n "$_cap" | tr '\n' ' '
 }
 # ---------------- 手动离线核心（App 点击单核下线） ----------------
-# 语义：manual_off 里记录的核，do_lock 会主动维持离线，do_unlock 会故意跳过不恢复。
-# 只有用户再次点击该核（或「恢复全部核心」/ 卸载 / 禁用）才会从清单里移除。
+# 语义：manual_off 里记录的核，do_lock 会主动维持离线，do_unlock 在性能场景临时恢复。
+# 只有用户再次点击该核（或「恢复全部核心」/ 卸载）才会从清单里移除。
 manual_list() {
     [ -f "$MANUAL_FILE" ] || return 0
     while IFS= read -r _m; do
@@ -345,9 +338,6 @@ manual_clear() {
 
 FREEZE_STATE="$CONFIG_DIR/freeze.state"     # 已冻结包清单（包名<TAB>原始状态<TAB>冻结方式）
 FREEZE_USER="${FREEZE_USER:-0}"             # 作用用户，0 = 机主
-# suspend 的 issuer 标识：必须是本模块自己的包名，unsuspend 时要与 suspend 时一致，
-# 否则包会保持挂起而记录被删，形成孤儿冻结状态。所以定义成全局常量，两处共用。
-FREEZE_ISSUER="com.zimky.coregate"
 
 # ---- 分组表 ----------------------------------------------------
 # 每行：组键|组显示名|包名（空格分隔）
@@ -389,7 +379,12 @@ grp_media|影音附加组件|com.coloros.karaoke com.oplus.audio.effectcenter co
 grp_cloud|云端备份同步|com.heytap.cloud com.android.sharedstoragebackup com.android.wallpaperbackup
 grp_diag|系统行为诊断|com.oplus.appsense com.oplus.motionsense com.oplus.audiomonitor
 grp_ad|广告推送聚合|com.heytap.mcs com.heytap.openid com.heytap.tas
-grp_self|作者自冻清单（C16.0.1.306 实测）|com.heytap.colorfulengine com.heytap.openid com.heytap.pictorial com.heytap.speechassist com.heytap.tas com.microsoft.appmanager com.newcall com.oplus.acc.gac com.oplus.aicall com.oplus.aimemory com.oplus.aiwidgets com.oplus.aiwriter com.oplus.apprecover com.oplus.cardigitalkey com.oplus.cast com.oplus.cellularqoe com.oplus.customize.coreapp com.oplus.deepthinker com.oplus.encryption com.oplus.keyguard.clock.base com.oplus.keyguard.clock.gallery com.oplus.keyguard.clock.graffiti com.oplus.keyguard.clock.magazine com.oplus.keyguard.personality.clocks com.oplus.keyguard.style.widgets com.oplus.logkit com.oplus.matrix com.oplus.olc com.oplus.omoji com.oplus.onetrace com.oplus.owork com.oplus.remotecontrol com.oplus.travelengine com.coloros.karaoke com.coloros.ocrscanner com.coloros.remoteguardservice com.coloros.scenemode com.coloros.sceneservice com.coloros.securepay com.coloros.securityguard com.coloros.sharescreen com.coloros.systemclone com.coloros.translate.engine com.coloros.video com.fido.fido2client com.google.android.gms com.google.android.gsf com.google.android.marvin.talkback com.google.android.projection.gearhead com.android.devicelockcontroller com.coloros.codebook com.coloros.colordirectservice'
+grp_self|作者自冻清单（C16.0.1.306 实测）|com.heytap.colorfulengine com.heytap.openid com.heytap.pictorial com.heytap.speechassist com.heytap.tas com.microsoft.appmanager com.newcall com.oplus.acc.gac com.oplus.aicall com.oplus.aimemory com.oplus.aiwidgets com.oplus.aiwriter com.oplus.apprecover com.oplus.cardigitalkey com.oplus.cast com.oplus.cellularqoe com.oplus.customize.coreapp com.oplus.deepthinker com.oplus.encryption com.oplus.keyguard.clock.base com.oplus.keyguard.clock.gallery com.oplus.keyguard.clock.graffiti com.oplus.keyguard.clock.magazine com.oplus.keyguard.personality.clocks com.oplus.keyguard.style.widgets com.oplus.logkit com.oplus.matrix com.oplus.olc com.oplus.omoji com.oplus.onetrace com.oplus.owork com.oplus.remotecontrol com.oplus.travelengine com.coloros.karaoke com.coloros.ocrscanner com.coloros.remoteguardservice com.coloros.scenemode com.coloros.sceneservice com.coloros.securepay com.coloros.securityguard com.coloros.sharescreen com.coloros.systemclone com.coloros.translate.engine com.coloros.video com.fido.fido2client com.google.android.gms com.google.android.gsf com.google.android.marvin.talkback com.google.android.projection.gearhead com.android.devicelockcontroller com.coloros.codebook com.coloros.colordirectservice
+grp_ai|AI 附加功能|com.oplus.aimemory com.oplus.aiunit com.oplus.aiwidgets com.oplus.aiwriter com.oplus.metis com.oplus.obrain
+grp_voice|语音助手|com.oplus.ovoicemanager com.oplus.ovoicemanager.wakeup com.heytap.speechassist
+grp_games|游戏空间|com.oplus.games com.oplus.cosa
+grp_themes|主题与杂志|com.oplus.themestore com.heytap.themestore com.heytap.pictorial
+grp_search|桌面搜索与负一屏|com.heytap.quicksearchbox com.coloros.assistantscreen com.coloros.ocs.opencapabilityservice'
 
 # 取某个组的包名列表（组键不存在则输出空）
 freeze_group_pkgs() {
@@ -410,12 +405,12 @@ freeze_group_on() {
 
 # 包是否真实存在于本机（避免对不存在的包反复 pm disable 刷日志）
 pkg_exists() {
-    pm list packages 2>/dev/null | grep -qx "package:$1"
+    pm list packages --user "$FREEZE_USER" 2>/dev/null | grep -qxF "package:$1"
 }
 
 # 包当前是否已被停用（不管是本模块停的还是用户自己停的）
 pkg_is_disabled() {
-    pm list packages -d 2>/dev/null | grep -qx "package:$1"
+    pm list packages -d --user "$FREEZE_USER" 2>/dev/null | grep -qxF "package:$1"
 }
 
 # ---------------- 停用记录 ----------------
@@ -457,155 +452,94 @@ freeze_record_set_mode() {  # $1=pkg $2=mode
     ' "$FREEZE_STATE" > "$FREEZE_STATE.tmp" 2>/dev/null && mv "$FREEZE_STATE.tmp" "$FREEZE_STATE" 2>/dev/null
 }
 
-# 取某包记录的冻结方式（缺省视作 disable，兼容旧格式两列记录）
-freeze_get_mode() {  # $1=pkg
-    [ -f "$FREEZE_STATE" ] || { echo "disable"; return 0; }
-    _m=$(awk -F'\t' -v p="$1" '$1==p{print $3; exit}' "$FREEZE_STATE" 2>/dev/null)
-    [ -z "$_m" ] && _m="disable"
-    echo "$_m"
-}
-
 # 强杀某包的进程（对齐 Logd_Disabler_ColorOS16 的 kill_pkg_procs）
 #
 # 【为什么不换 pgrep -U】
 #   参考模块 v2.3.1 的回滚注释记录得很清楚：pgrep -U 在 Android 上不安全，
 #   某些实现会返回全部 PID，配合 kill -9 会误杀 system_server 导致黑屏。
-#   所以这里坚持 am force-stop + pkill -f 的两段式，且不在其中用 kill -9。
-kill_pkg_procs() {  # $1=pkg
+#   所以这里只对明确包名执行 am force-stop。
+kill_pkg_procs() {
     am force-stop --user "$FREEZE_USER" "$1" >/dev/null 2>&1
-    _i=0
-    while [ "$_i" -lt 2 ]; do
-        pkill -f "$1" >/dev/null 2>&1
-        _i=$((_i + 1))
-        [ "$_i" -lt 2 ] && sleep 1
-    done
     return 0
 }
 
-# 停用单个包
-#
-# 【本函数逻辑完全对齐 starlifezzz/Logd_Disabler_ColorOS16 的 disable_pkg】
-#   顺序：pkg_live_state → 基线登记 → 基线非 enabled 直接跳过（不接管用户既存状态）
-#         → pm disable-user 主通道 → 成功后强杀进程
-#         → 失败再 pm disable 兜底 + 强杀
-#         → 两种都失败只 return 1，绝不 uninstall
-#
-# 【必须删掉的旧分支】
-#   旧实现里有 `pm uninstall -k --user 0` 作为第二兜底。参考模块把它作为
-#   P0 事故命令族永久移除（与「手动卸载导致不开机」同类），本模块一律不用。
-#   原因：uninstall -k 会让包从用户列表消失，卸载模块后 install-existing 未必能救回来，
-#   而 disable-user 是可逆的，重启/恢复都能还原。
-freeze_off_pkg() {  # $1=pkg
-    _p="$1"
-
-    # 1) 基线登记：首次接触时记下它「本来是什么状态」，之后永不覆盖
-    if ! freeze_is_recorded "$_p"; then
-        if pkg_is_disabled "$_p"; then
-            freeze_record_add "$_p" "disabled"
-            log "组件本已停用（用户的设置，保持原样）：$_p"
-            return 0
-        fi
-    fi
-
-    # 2) 已记录过（说明是本模块冻的），幂等返回
-    if freeze_is_recorded "$_p"; then
-        # 已记录但当前是启用态（比如用户手动打开了）→ 继续往下再冻一次
-        pkg_is_disabled "$_p" && return 0
-    fi
-
-    # 3) 包不存在就没什么可做的
-    pkg_exists "$_p" || return 1
-
-    # 4) 主通道：pm disable-user
-    _out=$(pm disable-user --user "$FREEZE_USER" "$_p" 2>&1)
-    case "$_out" in
-        *"new state: disabled"*|*Success*)
-            freeze_record_add "$_p" "enabled"
-            freeze_record_set_mode "$_p" "disable-user"
-            kill_pkg_procs "$_p"
-            log "组件冻结（disable-user）：$_p"
-            return 0
-            ;;
-    esac
-
-    # 5) 兜底：pm disable
-    _out=$(pm disable --user "$FREEZE_USER" "$_p" 2>&1)
-    case "$_out" in
-        *"new state: disabled"*|*Success*)
-            freeze_record_add "$_p" "enabled"
-            freeze_record_set_mode "$_p" "disable"
-            kill_pkg_procs "$_p"
-            log "组件冻结（disable）：$_p"
-            return 0
-            ;;
-    esac
-
-    # 6) 两种通道都失败：只做进程级强杀，记录为 force-stop，绝不卸载
-    if kill_pkg_procs "$_p"; then
-        freeze_record_add "$_p" "enabled"
-        freeze_record_set_mode "$_p" "force-stop"
-        log "组件冻结（仅进程级 force-stop）：$_p"
-        return 0
-    fi
-    return 1
+# 挂起状态须针对当前用户核实，不能把停用等同于冻结。
+pkg_is_suspended() {
+    local _suspend_dump
+    _suspend_dump=$(dumpsys package "$1" 2>/dev/null) || return 2
+    printf '%s
+' "$_suspend_dump" | awk -v u="User $FREEZE_USER:" '
+        index($0, u) { found=1; if ($0 ~ /suspended=true/) yes=1; exit }
+        END { if (!found) exit 2; exit !yes }'
+}
+freeze_record_mode() {
+    [ -f "$FREEZE_STATE" ] || return 0
+    awk -F'	' -v p="$1" '$1==p {print $3; exit}' "$FREEZE_STATE"
 }
 
-# 启用单个包
-#
-# 【逻辑对齐参考模块 enable_pkg】
-#   无改动记录 → 保持现状
-#   基线≠enabled（用户自己停用的）→ 不恢复
-#   当前已 enabled → 跳过；当前 missing（被用户卸载）→ 不复活
-#   pm enable --user 0 → 失败再 pm enable 兜底
-#   绝不 install-existing 复活用户自己卸载的包
-freeze_on_pkg() {  # $1=pkg
-    _p="$1"
-
-    # 没有任何改动记录 → 不是本模块冻的，保持现状
-    freeze_is_recorded "$_p" || return 1
-
-    # 原本就是 disabled 的（用户自己的设置）→ 只清记录，不打开
-    if [ "$(freeze_orig_state "$_p")" = "disabled" ]; then
-        freeze_record_del "$_p"
-        log "组件原本即为停用态，无需恢复：$_p"
-        return 0
+# 只挂起；设备拒绝挂起时明确报错，不改为停用应用。
+freeze_off_pkg() {
+    local _p="$1" _mode _susp_rc
+    pkg_exists "$_p" || return 1
+    if freeze_is_recorded "$_p"; then
+        case "$(freeze_orig_state "$_p")" in disabled|suspended) return 0;; esac
+        _mode=$(freeze_record_mode "$_p")
+        case "$_mode" in
+            suspend) pkg_is_suspended "$_p" && return 0 ;;
+            *)
+                # 将旧版由本模块造成的停用恢复，再迁移到挂起。
+                if pkg_is_disabled "$_p"; then
+                    pm enable --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
+                    pkg_is_disabled "$_p" && return 1
+                fi
+                ;;
+        esac
+    else
+        if pkg_is_disabled "$_p"; then
+            freeze_record_add "$_p" disabled
+            return $?
+        fi
+        pkg_is_suspended "$_p"; _susp_rc=$?
+        if [ "$_susp_rc" = 0 ]; then
+            freeze_record_add "$_p" suspended
+            return $?
+        fi
+        [ "$_susp_rc" = 1 ] || return 1
+        # 先记恢复信息，即使进程中断仍能解除本模块挂起。
+        freeze_record_add "$_p" enabled || return 1
     fi
+    freeze_record_set_mode "$_p" suspend || return 1
+    pm suspend --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
+    pkg_is_suspended "$_p" || return 1
+    kill_pkg_procs "$_p"
+    log "组件挂起：$_p"
+    return 0
+}
 
-    # 已经不在了（用户自己卸载）→ 不复活，只清记录
-    if ! pkg_exists "$_p"; then
-        freeze_record_del "$_p"
-        log "组件已不存在，不复活：$_p"
-        return 0
-    fi
-
-    # 本身就已是启用态 → 清记录即可
-    if ! pkg_is_disabled "$_p"; then
-        freeze_record_del "$_p"
-        return 0
-    fi
-
-    # 主通道：pm enable --user
-    _out=$(pm enable --user "$FREEZE_USER" "$_p" 2>&1)
-    case "$_out" in
-        *"new state: enabled"*|*Success*)
-            freeze_record_del "$_p"
-            log "组件恢复（enable）：$_p"
-            return 0
+# 根据记录恢复，失败时保留记录供重试。用户原有的停用/挂起保持原样。
+freeze_on_pkg() {
+    local _p="$1" _mode _orig _susp_rc
+    freeze_is_recorded "$_p" || return 0
+    _orig=$(freeze_orig_state "$_p")
+    case "$_orig" in
+        disabled|suspended) freeze_record_del "$_p"; return $? ;;
+    esac
+    if ! pkg_exists "$_p"; then freeze_record_del "$_p"; return $?; fi
+    _mode=$(freeze_record_mode "$_p")
+    case "$_mode" in
+        suspend)
+            pm unsuspend --user "$FREEZE_USER" "$_p" >/dev/null 2>&1 || return 1
+            pkg_is_suspended "$_p"; _susp_rc=$?
+            [ "$_susp_rc" = 1 ] || return 1
+            ;;
+        *)
+            if pkg_is_disabled "$_p"; then
+                pm enable --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
+                pkg_is_disabled "$_p" && return 1
+            fi
             ;;
     esac
-
-    # 兜底：不带 --user 的 pm enable
-    _out=$(pm enable "$_p" 2>&1)
-    case "$_out" in
-        *"new state: enabled"*|*Success*)
-            freeze_record_del "$_p"
-            log "组件恢复（enable 兜底）：$_p"
-            return 0
-            ;;
-    esac
-
-    # 刻意不调用 pm install-existing —— 绝不复活用户自己卸载的包
-    return 1
+    freeze_record_del "$_p"
 }
 
 # 某个包是否还被【本组之外】的其它「已开启」组占用
@@ -631,6 +565,48 @@ freeze_pkg_used_by_other() {  # $1=pkg  $2=当前组键（跳过自身）
     done
 }
 
+# 跨进程互斥；持有者退出后允许清理遗留锁。
+freeze_lock() {
+    _fl_wait=0
+    while ! mkdir "$CONFIG_DIR/freeze.lock" 2>/dev/null; do
+        _fl_owner=$(cat "$CONFIG_DIR/freeze.lock/pid" 2>/dev/null)
+        case "$_fl_owner" in
+            ''|*[!0-9]*) : ;;
+            *) if ! kill -0 "$_fl_owner" 2>/dev/null; then
+                   rm -f "$CONFIG_DIR/freeze.lock/pid"
+                   rmdir "$CONFIG_DIR/freeze.lock" 2>/dev/null
+                   continue
+               fi ;;
+        esac
+        _fl_wait=$((_fl_wait + 1))
+        [ "$_fl_wait" -ge 30 ] && return 1
+        sleep 1
+    done
+    echo $$ > "$CONFIG_DIR/freeze.lock/pid"
+}
+freeze_unlock() {
+    [ "$(cat "$CONFIG_DIR/freeze.lock/pid" 2>/dev/null)" = "$$" ] || return 0
+    rm -f "$CONFIG_DIR/freeze.lock/pid"
+    rmdir "$CONFIG_DIR/freeze.lock" 2>/dev/null
+}
+
+# 单包选择优先于分组；只保存用户明确操作过的包。
+FREEZE_MANUAL="$CONFIG_DIR/freeze_manual"
+freeze_manual_get() {
+    [ -f "$FREEZE_MANUAL" ] || return 0
+    awk -F '\t' -v p="$1" '$1==p {print $2; exit}' "$FREEZE_MANUAL"
+}
+freeze_manual_set() {
+    _fm_pkg="$1"; _fm_value="$2"
+    { [ ! -f "$FREEZE_MANUAL" ] || awk -F '\t' -v p="$_fm_pkg" '$1!=p' "$FREEZE_MANUAL";
+      printf '%s\t%s\n' "$_fm_pkg" "$_fm_value";
+    } > "$FREEZE_MANUAL.$$.tmp" && mv "$FREEZE_MANUAL.$$.tmp" "$FREEZE_MANUAL"
+}
+freeze_manual_del() {
+    [ -f "$FREEZE_MANUAL" ] || return 0
+    awk -F '\t' -v p="$1" '$1!=p' "$FREEZE_MANUAL" > "$FREEZE_MANUAL.$$.tmp" && mv "$FREEZE_MANUAL.$$.tmp" "$FREEZE_MANUAL"
+}
+
 # 主同步：把「已开启的组」确保停用、「已关闭的组」确保恢复
 # 幂等，可以每轮循环调用，重复执行无副作用
 #
@@ -640,45 +616,46 @@ freeze_pkg_used_by_other() {  # $1=pkg  $2=当前组键（跳过自身）
 # 于是 pkg_is_disabled 恒为真 → 引擎一次 pm 都不调用，只写记录，
 # 测试却全绿 —— 这是最危险的一类虚假通过。改引擎或改测试后，
 # 必须确认「开组后包状态真的变成 disabled」这条断言存在且为 PASS。
-freeze_sync() {
-    echo "$FREEZE_TABLE" | while IFS= read -r _line; do
-        [ -z "$_line" ] && continue
-        _k=$(printf %s "$_line" | cut -d"|" -f1)
-        _pkgs=$(printf %s "$_line" | cut -d"|" -f3-)
-        :
-        if freeze_group_on "$_k"; then
-            for _p in $_pkgs; do
-                freeze_off_pkg "$_p"
-            done
-        else
-            for _p in $_pkgs; do
-                # 若还有别的「已开启」组在用这个包，就不能恢复它
-                _holder=$(freeze_pkg_used_by_other "$_p" "$_k")
-                if [ -n "$_holder" ]; then
-                    continue
-                fi
-                freeze_on_pkg "$_p"
-            done
+freeze_sync_impl() {
+    _fs_packages=$(printf '%s\n' "$FREEZE_TABLE" | cut -d'|' -f3 | tr ' ' '\n' | sort -u)
+    _fs_fail=0
+    for _fs_pkg in $_fs_packages; do
+        pkg_exists "$_fs_pkg" || continue
+        _fs_want=$(freeze_manual_get "$_fs_pkg")
+        if [ -z "$_fs_want" ]; then
+            _fs_want=false
+            [ -n "$(freeze_pkg_used_by_other "$_fs_pkg" '')" ] && _fs_want=true
+        fi
+        if [ "$_fs_want" = true ]; then
+            freeze_off_pkg "$_fs_pkg" || _fs_fail=1
+        elif freeze_is_recorded "$_fs_pkg"; then
+            freeze_on_pkg "$_fs_pkg" || _fs_fail=1
         fi
     done
+    return "$_fs_fail"
+}
+
+freeze_sync() {
+    freeze_lock || return 1
+    freeze_sync_impl
+    _fs_result=$?
+    freeze_unlock
+    return "$_fs_result"
 }
 
 # 全部恢复（服务退出 / 卸载 / 一键全恢复时调用）
 # 严格按原始状态还原，原本 disabled 的保持 disabled
 freeze_restore_all() {
-    [ -f "$FREEZE_STATE" ] || return 0
-    while IFS='	' read -r _p _st _md; do
-        [ -z "$_p" ] && continue
-        if [ "$_st" = "enabled" ]; then
-            # 三种还原方式都走一遍：不管当初是 disable-user / uninstall / force-stop 都能还原，
-            # 各自失败的调用是空操作，不会造成副作用。同样不带 --package。
-            pm enable --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
-            pm install-existing --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
-            pm unsuspend --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
-        fi
-    done < "$FREEZE_STATE"
-    rm -f "$FREEZE_STATE" 2>/dev/null
-    log "可选组件已按原始状态复原"
+    freeze_lock || return 1
+    local _restore_fail=0
+    if [ -f "$FREEZE_STATE" ]; then
+        _restore_pkgs=$(cut -f1 "$FREEZE_STATE")
+        for _restore_pkg in $_restore_pkgs; do
+            freeze_on_pkg "$_restore_pkg" || _restore_fail=1
+        done
+    fi
+    freeze_unlock
+    return "$_restore_fail"
 }
 
 # 状态查询：输出当前实际被停用/挂起的包（不管是否本模块所为），供状态面板展示
@@ -703,10 +680,10 @@ freeze_restore_all() {
 #   停用状态仍用 pm list packages -d（这个参数语义正确，实测可靠）。
 freeze_status_report() {
     # 1) 停用列表：pm list packages -d 语义正确，直接采信
-    pm list packages -d 2>/dev/null | sed 's/^package://' | sed 's/$/\tdisabled/'
+    pm list packages -d --user "$FREEZE_USER" 2>/dev/null | sed 's/^package://' | sed 's/$/\tdisabled/'
     # 2) 挂起列表：从 dumpsys package 里按包名上下文找 suspended=true
     #    只认 user 0（FREEZE_USER 默认 0），与冻结时保持同一用户口径
-    dumpsys package 2>/dev/null | awk -v u="User $FREEZE_USER:" '
+    dumpsys package --all-components packages 2>/dev/null | awk -v u="User $FREEZE_USER:" '
         /^[[:space:]]*Package \[/ {
             # 形如 "  Package [com.foo.bar] (abc123):"
             pkg = $0
@@ -736,40 +713,86 @@ freeze_status_report() {
 # 逐核渐进封锁。注意：这里【没有】"被系统拉回 N 次就放弃"的机制——
 # 被拉回只记录失败，下一轮继续努力封锁，保证用户配置始终真正生效。
 LOCK_STATE=""   # 本轮各核封锁结果，仅用于日志
-do_lock() {
-    LOCK_STATE=""
-    [ "$DISABLE_CC" = "true" ] && disable_core_ctl
-    for c in $LOCK_LIST; do
-        [ "$c" = "0" ] && continue                     # cpu0 永不下线
-        if cpu_online "$c"; then
-            if set_cpu "$c" 0; then
-                LOCK_STATE="${LOCK_STATE}${c}:ok "
-                sleep 1   # 逐核渐进：避免同时离线多核造成系统冲击
-            else
-                LOCK_STATE="${LOCK_STATE}${c}:fail "
-                log "封锁 cpu$c 失败（可能被内核/厂商策略拒绝）"
-            fi
+# Shared by daemon and short-lived App commands. Dead owners are reclaimed.
+core_guard_enter() {
+    local _tries=0 _owner
+    while ! mkdir "$CONFIG_DIR/core.lock" 2>/dev/null; do
+        _owner=$(cat "$CONFIG_DIR/core.lock/pid" 2>/dev/null)
+        if [ -n "$_owner" ] && ! kill -0 "$_owner" 2>/dev/null; then
+            rm -f "$CONFIG_DIR/core.lock/pid"
+            rmdir "$CONFIG_DIR/core.lock" 2>/dev/null
         fi
+        _tries=$((_tries+1))
+        [ "$_tries" -ge 15 ] && return 1
+        sleep 1
     done
-    # 维持用户「手动离线」的核：它们不在 LOCK_LIST 里，也必须保持离线。
-    # 不写 LOCK_STATE（那是自动封锁的结果）、不 sleep（避免主循环被拖慢）。
-    for c in $(manual_list); do
-        cpu_online "$c" && set_cpu "$c" 0
+    echo $$ > "$CONFIG_DIR/core.lock/pid"
+}
+core_guard_leave() {
+    rm -f "$CONFIG_DIR/core.lock/pid"
+    rmdir "$CONFIG_DIR/core.lock" 2>/dev/null
+}
+# A driver may change sibling cores while offlining a selected core.
+# Reconcile the complement only after all requested cores have been offlined.
+core_restore_except() {
+    local _core
+    for _core in $(all_cpus); do
+        [ "$_core" = 0 ] && continue
+        case " $1 " in *" $_core "*) continue;; esac
+        cpu_online "$_core" || set_cpu "$_core" 1
     done
+}
+do_lock() {
+    local c _desired _manual _pass
+    LOCK_STATE=""
+    core_guard_enter || { log "核心控制繁忙，本轮跳过"; return 1; }
+    if [ "$DISABLE_CC" = "true" ]; then disable_core_ctl; else restore_core_ctl; fi
+    _manual=$(manual_list | xargs)
+    # A manual choice replaces automatic suggestions, so selecting CPU5 does not add CPU7.
+    if [ -n "$_manual" ] && [ "$(cfg_val lock_cores auto)" = auto ]; then
+        _desired="$_manual"
+    else
+        _desired="$LOCK_LIST $_manual"
+    fi
+    # 温度额外名单在手动 / 自动日常名单确定后合并，避免被手动模式覆盖。
+    _desired="$_desired $THERMAL_EXTRA_ACTIVE"
+    for c in $_desired; do
+        case "$c" in ''|0|*[!0-9]*) continue;; esac
+        if cpu_online "$c"; then set_cpu "$c" 0 && sleep 1; fi
+    done
+    for _pass in 1 2 3; do core_restore_except "$_desired"; done
+    for c in $_desired; do
+        case "$c" in ''|0|*[!0-9]*) continue;; esac
+        if cpu_online "$c"; then LOCK_STATE="${LOCK_STATE}${c}:fail "
+        else LOCK_STATE="${LOCK_STATE}${c}:ok "; fi
+    done
+    core_guard_leave
 }
 do_unlock() {
-    # 手动离线的核由用户自己点回来，自动恢复流程必须跳过它们，
-    # 否则用户点了「全核在线」按钮后核心又被系统悄悄拉回来（或反过来被强行恢复）。
-    _keep=$(manual_list | tr '\n' ' ')
-    for c in $LOCK_LIST; do
-        [ "$c" = "0" ] && continue
-        case " $_keep " in *" $c "*) continue;; esac
-        if ! cpu_online "$c"; then
-            set_cpu "$c" 1 && log "恢复 cpu$c"
-        fi
+    local c _pass _missing
+    UNLOCK_FAILED=""
+    core_guard_enter || { UNLOCK_FAILED="busy"; return 1; }
+    # Keep core_ctl disabled while full-core performance is requested.
+    # Its original values stay in the backup and are restored on exit/daily policy.
+    disable_core_ctl
+    for _pass in 1 2 3; do
+        core_restore_except ""
+        _missing=""
+        for c in $(all_cpus); do
+            [ "$c" = 0 ] && continue
+            cpu_online "$c" || _missing="$_missing $c"
+        done
+        [ -z "$_missing" ] && break
+        [ "$_pass" -lt 3 ] && sleep 1
     done
+    UNLOCK_FAILED="$_missing"
+    core_guard_leave
+    if [ -n "$UNLOCK_FAILED" ]; then
+        log "恢复未完成，仍离线:$UNLOCK_FAILED"
+        return 1
+    fi
+    return 0
 }
-
 # ---------------- 日常限频（锁定安全频率上限，进一步省电） ----------------
 # 设计取舍：
 #   1) 用【绝对频率上限】而非百分比，避免不同核心硬件上限差异导致数学误差；
@@ -792,6 +815,10 @@ CAP_GPU_MHZ=500          # GPU 上限
 CAP_GPU_PWRLEVEL=13      # GPU 最高功耗档位
 # 从 config 读取自定义值；0 或非法值 = 未自定义，保留上面的默认
 freq_cap_load_config() {
+    CAP_LITTLE_MHZ=2266
+    CAP_BIG_MHZ=1651
+    CAP_GPU_MHZ=500
+    CAP_GPU_PWRLEVEL=13
     _v=$(cfg_int cap_little_mhz 0)
     [ "$_v" -gt 0 ] 2>/dev/null && CAP_LITTLE_MHZ=$_v
     _v=$(cfg_int cap_big_mhz 0)
@@ -1077,14 +1104,107 @@ LIMIT_FREQ="false"
 AUTO_COUNT=1
 DISABLE_CC="false"
 SAFE_MODE=0
-INTERVAL=30
+INTERVAL=10
+
+# ---------------- 温度策略（仅读取传感器，不改系统温控） ----------------
+THERMAL_HOT=0
+THERMAL_KEY=""
+THERMAL_EXTRA_ACTIVE=""
+THERMAL_TEMP=""
+THERMAL_STATE_FILE="$CONFIG_DIR/temperature.state"
+
+thermal_read() {
+    # Android 电池节点单位为 0.1℃；统一输出毫摄氏度，不用 CPU 热点替代。
+    _battery_temp=$(cat /sys/class/power_supply/battery/temp 2>/dev/null)
+    case "$_battery_temp" in ''|*[!0-9-]*) _battery_temp="";; esac
+    if [ -n "$_battery_temp" ] && [ "$_battery_temp" -ge -200 ] 2>/dev/null && [ "$_battery_temp" -le 1000 ]; then
+        echo "$((_battery_temp * 100))"
+        return
+    fi
+    dumpsys battery 2>/dev/null | awk '/^[[:space:]]*temperature:/ {
+        if ($2 ~ /^-?[0-9]+$/ && $2 >= -200 && $2 <= 1000) printf "%.0f\n", $2 * 100;
+        exit
+    }'
+}
+
+thermal_publish() {
+    printf '%s|%s|%s|%s|%s|battery|%s|%s\n' "$_thermal_status" "$THERMAL_TEMP" "$THERMAL_MODE" "$THERMAL_THRESHOLD" "$(date +%s)" "$THERMAL_EXTRA_CONFIG" "$THERMAL_EXTRA_ACTIVE" > "$THERMAL_STATE_FILE.$$.tmp" &&
+        mv -f "$THERMAL_STATE_FILE.$$.tmp" "$THERMAL_STATE_FILE"
+}
+
+thermal_select_extra() {
+    THERMAL_EXTRA_ACTIVE=""
+    _extra_raw=$(printf '%s' "$THERMAL_EXTRA_CONFIG" | tr ',、' ' ')
+    for _extra_cpu in $_extra_raw; do
+        case "$_extra_cpu" in ''|0|*[!0-9]*) continue;; esac
+        [ -d "/sys/devices/system/cpu/cpu$_extra_cpu" ] || continue
+        case " $THERMAL_EXTRA_ACTIVE " in *" $_extra_cpu "*) continue;; esac
+        THERMAL_EXTRA_ACTIVE="$THERMAL_EXTRA_ACTIVE $_extra_cpu"
+    done
+}
+
+thermal_decide() {
+    THERMAL_EXTRA_ACTIVE=""
+    if [ "$THERMAL_MODE" = lock ] && [ "$GAME_ACTIVE" = 1 ]; then
+        # 游戏恢复优先，退出游戏后重新判断温度；不沿用游戏期间的滞回状态。
+        THERMAL_HOT=0
+        [ "$THERMAL_ENABLED" = true ] && [ "$ENABLED" = true ] && [ "$SAFE_MODE" != 1 ] && _thermal_status=game_skipped
+    elif [ "$THERMAL_HOT" = 1 ]; then
+        if [ "$THERMAL_MODE" = unlock ]; then
+            want_lock=no
+        elif [ "$want_lock" = yes ]; then
+            thermal_select_extra
+            [ -n "$THERMAL_EXTRA_ACTIVE" ] || _thermal_status=no_extra
+        else
+            _thermal_status=scene_skipped
+        fi
+    fi
+    thermal_publish
+}
+
+thermal_update() {
+    THERMAL_ENABLED=$(cfg_bool temperature_enabled false)
+    THERMAL_MODE=$(cfg_val temperature_mode lock)
+    [ "$THERMAL_MODE" = "unlock" ] || THERMAL_MODE=lock
+    THERMAL_THRESHOLD=$(cfg_int temperature_threshold 40)
+    case "$THERMAL_THRESHOLD" in ''|*[!0-9]*) THERMAL_THRESHOLD=40;; esac
+    [ "$THERMAL_THRESHOLD" -lt 35 ] && THERMAL_THRESHOLD=35
+    [ "$THERMAL_THRESHOLD" -gt 60 ] && THERMAL_THRESHOLD=60
+    THERMAL_EXTRA_CONFIG=$(cfg_val temperature_lock_cores "")
+    THERMAL_EXTRA_ACTIVE=""
+    _tk="$THERMAL_ENABLED|$THERMAL_MODE|$THERMAL_THRESHOLD|$THERMAL_EXTRA_CONFIG|$ENABLED|$SAFE_MODE"
+    if [ "$THERMAL_KEY" != "$_tk" ]; then THERMAL_HOT=0; THERMAL_KEY="$_tk"; fi
+    _old_hot="$THERMAL_HOT"
+    THERMAL_TEMP=""
+    _thermal_status=disabled
+    if [ "$THERMAL_ENABLED" = "true" ] && [ "$ENABLED" = "true" ] && [ "$SAFE_MODE" != "1" ]; then
+        THERMAL_TEMP=$(thermal_read)
+        if [ -z "$THERMAL_TEMP" ]; then
+            # 电池温度不可用时撤销温度策略，回到普通策略。
+            THERMAL_HOT=0; _thermal_status=unavailable
+        else
+            if [ "$THERMAL_TEMP" -ge "$((THERMAL_THRESHOLD * 1000))" ]; then
+                THERMAL_HOT=1
+            elif [ "$THERMAL_TEMP" -le "$(((THERMAL_THRESHOLD - 3) * 1000))" ]; then
+                THERMAL_HOT=0
+            fi
+            _thermal_status=watching
+            [ "$THERMAL_HOT" = "1" ] && _thermal_status=active
+        fi
+    else
+        THERMAL_HOT=0
+    fi
+    if [ "$_old_hot" != "$THERMAL_HOT" ]; then
+        log "温度策略：$_thermal_status mode=$THERMAL_MODE temp=${THERMAL_TEMP}mC threshold=${THERMAL_THRESHOLD}C"
+    fi
+}
 
 # ---------------- 完全恢复（可逆性保证） ----------------
 # 卸载 / 删除 / 禁用时：恢复核心、频率、core_ctl 原始值，不留任何运行残留
 restore_all() {
-    # 卸载 / 删除 / 禁用时必须先清空手动清单，否则 do_unlock 会「尊重」清单
-    # 而故意跳过那些核，导致卸载后仍有核心处于离线状态 —— 违反零残留原则。
-    manual_clear
+    # 卸载清空手动意图，避免以后重新启用时沿用旧封锁。
+    [ "$1" = "preserve" ] || manual_clear
+    rm -f "$THERMAL_STATE_FILE" "$THERMAL_STATE_FILE.$$.tmp"
     LOCK_LIST=$(all_cpus)
     do_unlock
     remove_freq_cap
@@ -1105,7 +1225,12 @@ cleanup_on_exit() {
     [ "$TRAP_ARMED" = "1" ] || return 0
     [ "$TRAP_DONE" = "1" ] && exit 0
     TRAP_DONE=1
-    restore_all
+    if [ "$(cat "$CONFIG_DIR/core.lock/pid" 2>/dev/null)" = "$$" ]; then core_guard_leave; fi
+    if [ -f "$MODDIR/module.prop" ] && [ ! -f "$MODDIR/remove" ] && [ ! -f "$MODDIR/disable" ]; then
+        restore_all preserve
+    else
+        restore_all
+    fi
     rm -f "$PID_FILE" "$CONFIG_DIR/crash_flag"
     log "模块服务已退出，全部恢复原始状态"
     exit 0
@@ -1115,6 +1240,8 @@ trap cleanup_on_exit TERM INT EXIT
 run() {
     # 进入守护主循环：此后退出（TERM/INT/EXIT）才需要全量还原，武装 trap。
     TRAP_ARMED=1
+    echo $$ > "$PID_FILE" 2>/dev/null
+    rm -f "$CONFIG_DIR/high_cores"
     state=""; pkg=""; want_lock=""; last_pkg=""; lock_logged=0; ss=""; it2=0; last_ss=""
     prev_unlocked=0; oc_now=""
 
@@ -1129,7 +1256,8 @@ run() {
 
     # ========== 崩溃自愈：上次异常退出（系统崩溃/强杀）→ 本次进入安全模式，不锁任何核 ==========
     CRASH_FLAG="$CONFIG_DIR/crash_flag"
-    if [ -f "$CRASH_FLAG" ]; then
+    BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+    if [ -n "$BOOT_ID" ] && [ "$(cat "$CRASH_FLAG" 2>/dev/null)" = "$BOOT_ID" ]; then
         SAFE_MODE=1
         log "⚠️ 检测到上次异常退出标记，进入【安全模式】：本次不封锁任何核心（重启一次后自动恢复）"
     else
@@ -1159,14 +1287,43 @@ run() {
 
     # 首次应用（安全模式下不锁核；锁核前预置崩溃标记，20 秒系统正常后解除）
     ENABLED=$(cfg_bool enabled true)
-    if [ "$ENABLED" = "true" ] && [ -n "$LOCK_LIST" ] && [ "$SAFE_MODE" = "0" ]; then
-        touch "$CRASH_FLAG"
+    thermal_update
+    GAME_LIST=$(grep -v '^#' "$PACKAGES_FILE" 2>/dev/null | grep -v '^$')
+    GAME_ACTIVE=0
+    PKGS=$(fg_pkgs)
+    if [ -n "$GAME_LIST" ] && is_game "$PKGS"; then GAME_ACTIVE=1; fi
+    want_lock=yes
+    [ "$GAME_ACTIVE" = 1 ] && want_lock=no
+    CAPTURE_BOOST=$(cfg_bool capture_boost false)
+    CAPTURE_LIST=""
+    if [ "$CAPTURE_BOOST" = true ]; then
+        CAPTURE_LIST=$(grep -v '^#' "$CAPTURE_FILE" 2>/dev/null | grep -v '^$')
+        [ -n "$CAPTURE_LIST" ] || CAPTURE_LIST="$CAPTURE_DEFAULT"
+        [ -n "$CAPTURE_LIST" ] && is_capture "$PKGS" && want_lock=no
+    fi
+    NO_CHARGE=$(cfg_bool no_lock_charging false)
+    [ "$NO_CHARGE" = true ] && is_charging && want_lock=no
+    thermal_decide
+    if [ "$want_lock" = no ] && [ "$ENABLED" = true ] && [ "$SAFE_MODE" = 0 ]; then
+        do_unlock
+        remove_freq_cap
+        state="unlocked"
+        echo "unlocked|$(echo "$PKGS" | head -1)" > "$STATE_FILE"
+    elif [ "$ENABLED" = "true" ] && [ -n "$LOCK_LIST" ] && [ "$SAFE_MODE" = "0" ] &&
+        { [ "$THERMAL_HOT" != "1" ] || [ "$THERMAL_MODE" != "unlock" ]; }; then
+        printf '%s\n' "$BOOT_ID" > "$CRASH_FLAG"
         do_lock
         sleep 20
         rm -f "$CRASH_FLAG"
         state="locked"
         echo "locked|boot" > "$STATE_FILE"
         log "启动完成，日常模式：大核已封锁"
+    elif [ "$ENABLED" = "true" ] && [ "$SAFE_MODE" = "0" ] && [ "$THERMAL_HOT" = "1" ] && [ "$THERMAL_MODE" = "unlock" ]; then
+        do_unlock
+        remove_freq_cap
+        state="unlocked"
+        echo "unlocked|boot" > "$STATE_FILE"
+        log "启动完成，温度策略：恢复全部核心"
     elif [ "$SAFE_MODE" = "1" ]; then
         echo "safe|-" > "$STATE_FILE"
         log "启动完成（安全模式：未封锁任何核心）"
@@ -1179,7 +1336,7 @@ run() {
 
     while :; do
         # 自检：模块被删除 / 卸载中 / 被禁用 → 恢复全部并退出（保证无残留）
-        if [ ! -f "$MODDIR/module.prop" ] || [ -f "$MODDIR/remove" ] || [ -f "/data/adb/modules/${MODULE_ID}.disable" ]; then
+        if [ ! -f "$MODDIR/module.prop" ] || [ -f "$MODDIR/remove" ] || [ -f "$MODDIR/disable" ] || [ -f "/data/adb/modules/${MODULE_ID}.disable" ]; then
             log "检测到模块已删除/禁用，恢复全部核心并退出"
             cleanup_on_exit
         fi
@@ -1197,8 +1354,8 @@ run() {
         fi
         LIMIT_FREQ=$(cfg_bool limit_freq false)
         # poll_interval：检测间隔（秒），有效范围 5~600。
-        # 非法值（空/非数字）一律回退默认 30 秒；不再有"0=自动跟随"的特殊语义。
-        INTERVAL=$(cfg_int poll_interval 30)
+        # 非法值（空/非数字）一律回退默认 10 秒；不再有"0=自动跟随"的特殊语义。
+        INTERVAL=$(cfg_int poll_interval 10)
         NO_CHARGE=$(cfg_bool no_lock_charging false)
         GAME_LIST=$(grep -v '^#' "$PACKAGES_FILE" 2>/dev/null | grep -v '^$')
         # 录屏 / 相机自动恢复：开关关闭则跳过检测；开启时优先读 capture.txt，读空/缺失用内置默认兜底
@@ -1211,26 +1368,28 @@ run() {
         fi
 
         case "$INTERVAL" in
-            ''|*[!0-9]*) INTERVAL=30;;
+            ''|*[!0-9]*) INTERVAL=10;;
         esac
         # 直接钳制到合法区间 5~600（不再有 0=自动 的特殊分支）
         [ "$INTERVAL" -lt 5 ] && INTERVAL=5
         [ "$INTERVAL" -gt 600 ] && INTERVAL=600
+
+        thermal_update
 
         # ---- 可选组件停用：必须放在主开关判断之前 ----
         # 原因：用户把模块主开关关掉、或进入安全模式时，下面会 continue 直接跳过本轮，
         # 而「组件停用」属于必须随主开关一起失效的功能，所以恢复动作要在这里先做。
         # 幂等：状态已同步时每轮只读文件、不真正调用 pm，开销可忽略。
         if [ "$ENABLED" != "true" ] || [ "$SAFE_MODE" = "1" ]; then
+            thermal_publish
             freeze_restore_all
-        else
-            freeze_sync
         fi
 
         # ---- 主开关 / 安全模式：关闭则全部恢复 ----
         if [ "$ENABLED" != "true" ] || [ "$SAFE_MODE" = "1" ]; then
             if [ "$state" != "off" ] && [ "$state" != "safe" ]; then
                 do_unlock
+                restore_core_ctl
                 remove_freq_cap
                 last_pkg=""
                 if [ "$SAFE_MODE" = "1" ]; then
@@ -1277,14 +1436,18 @@ run() {
         # ---- 决策：是否封锁（息屏一律锁定） ----
         want_lock=yes
         # 游戏 或 录屏/相机：两者都需要全部核心在线，命中任一即不封锁
+        GAME_ACTIVE=0
         if [ "$ss" != "OFF" ]; then
-            [ -n "$GAME_LIST" ] && is_game "$PKGS" && want_lock=no
+            if [ -n "$GAME_LIST" ] && is_game "$PKGS"; then GAME_ACTIVE=1; want_lock=no; fi
             [ "$want_lock" = "yes" ] && [ -n "$CAPTURE_LIST" ] && is_capture "$PKGS" && want_lock=no
         fi
         # 充电时不封锁
         if [ "$want_lock" = "yes" ] && [ "$NO_CHARGE" = "true" ] && is_charging; then
             want_lock=no
         fi
+
+        # 高温解封保持原行为；高温额外锁核仅叠加于日常锁核，游戏优先。
+        thermal_decide
 
         # ---- 执行 ----
         if [ "$want_lock" = "yes" ]; then
@@ -1308,7 +1471,7 @@ run() {
                 log "封锁结果：[${LOCK_STATE}] 当前在线核心 ${oc_now} 个"
             fi
             state="locked"
-            if [ "$last_pkg" != "$pkg" ]; then
+            if [ "$last_pkg" != "$pkg" ] || [ "$(cat "$STATE_FILE" 2>/dev/null)" != "$state|$pkg" ]; then
                 last_pkg="$pkg"
                 echo "locked|$pkg" > "$STATE_FILE"
             fi
@@ -1318,12 +1481,14 @@ run() {
             fi
             do_unlock
             remove_freq_cap
-            state="unlocked"
-            if [ "$last_pkg" != "$pkg" ]; then
+            if [ -z "$UNLOCK_FAILED" ]; then state="unlocked"; else state="unlock_partial"; fi
+            if [ "$last_pkg" != "$pkg" ] || [ "$(cat "$STATE_FILE" 2>/dev/null)" != "$state|$pkg" ]; then
                 last_pkg="$pkg"
-                echo "unlocked|$pkg" > "$STATE_FILE"
+                echo "$state|$pkg" > "$STATE_FILE"
             fi
         fi
+
+        freeze_sync
 
         # ---- 间隔：完全由用户配置的 poll_interval 决定，不再有任何硬编码覆盖 ----
         # 只有"刚退出游戏 / 刚进入游戏"的过渡轮用 5 秒短间隔，让锁核状态尽快对齐；
@@ -1352,9 +1517,17 @@ run() {
 #       现改为在进入循环前先解析参数，一次性命令执行完立即退出，不驻留。
 # ================================================================
 lock_once() {
+    AUTO_COUNT=$(cfg_int auto_lock_count 1)
     # 一次性封锁：加载当前配置 → 封锁 → 视限频开关决定是否限频 → 退出
     # 注意：不写 PID、不进循环、不装 trap（避免退出时把用户刚锁好的核又全部解开）
     ENABLED=$(cfg_bool enabled true)
+    if [ -n "$1" ]; then
+        case "$1" in
+            *[!0-9]*) : ;;
+            *) AUTO_COUNT="$1"; [ "$AUTO_COUNT" -lt 1 ] && AUTO_COUNT=1;
+               [ "$AUTO_COUNT" -gt 4 ] && AUTO_COUNT=4 ;;
+        esac
+    fi
     LOCK_LIST=$(cfg_val lock_cores auto)
     if [ "$LOCK_LIST" = "auto" ]; then
         LOCK_LIST=$(detect_high)
@@ -1370,7 +1543,7 @@ lock_once() {
                 [ "$n" -lt 1 ] && n=1
                 [ "$n" -gt 4 ] && n=4
                 # 取名单里靠后的 n 个核心（detect_high 默认把最高频核放最后）
-                LOCK_LIST=$(echo "$LOCK_LIST" | tr ' ' '\n' | grep -v '^0$' | tail -n "$n" | tr '\n' ' ')
+                LOCK_LIST=$(echo "$LOCK_LIST" | tr ' ' '\n' | grep -E '^[0-9]+$' | grep -v '^0$' | sort -nr | head -n "$n" | tr '\n' ' ')
                 ;;
         esac
     fi
@@ -1389,6 +1562,8 @@ lock_once() {
     do_lock
     if [ "$LIMIT_FREQ" = "true" ]; then
         apply_freq_cap
+    else
+        remove_freq_cap
     fi
     oc=$(online_count)
     echo "LOCK_ONCE_DONE: 名单=[$LOCK_LIST] 结果=[${LOCK_STATE}] 在线=${oc}"
@@ -1396,7 +1571,8 @@ lock_once() {
 }
 
 unlock_once() {
-    # 一次性恢复：解锁全部核心 + 撤销限频（不动守护进程本身）
+    # 一次性恢复：清除手动封锁意图，解锁全部核心并撤销限频。
+    manual_clear
     LOCK_LIST=$(cfg_val lock_cores auto)
     if [ "$LOCK_LIST" = "auto" ]; then
         LOCK_LIST=$(detect_high)
@@ -1406,7 +1582,12 @@ unlock_once() {
     do_unlock
     remove_freq_cap
     oc=$(online_count)
+    if [ -n "$UNLOCK_FAILED" ]; then
+        echo "UNLOCK_ONCE_FAILED: 在线=${oc} 仍离线=[$UNLOCK_FAILED]"
+        exit 1
+    fi
     echo "UNLOCK_ONCE_DONE: 在线=${oc}"
+    echo "OK"
     exit 0
 }
 
@@ -1421,16 +1602,23 @@ case "$1" in
     --core-off)
         # App 点单个核心 = 要求它一直保持离线。
         # 只写清单 + 立刻下一次线，剩下的交给主循环维持：
-        # do_lock() 每轮都会把 manual_list 里的核按回离线，do_unlock() 则跳过它们，
-        # 这样即使用户切到游戏（触发自动恢复）也不会被系统悄悄拉回来。
+        # 日常模式维持手动清单；游戏 / 录屏 / 相机场景临时恢复全部核心。
         shift
         _c="$1"
         case "$_c" in ''|*[!0-9]*) echo "BADCPU"; exit 1;; esac
         if manual_add "$_c"; then
-            if [ -f "/sys/devices/system/cpu/cpu$_c/online" ]; then
-                echo 0 > "/sys/devices/system/cpu/cpu$_c/online" 2>/dev/null
+            AUTO_COUNT=$(cfg_int auto_lock_count 1)
+            LOCK_LIST=$(cfg_val lock_cores auto)
+            if [ "$LOCK_LIST" = auto ]; then LOCK_LIST=$(detect_high); fi
+            LOCK_LIST=$(printf '%s' "$LOCK_LIST" | tr ',、' ' ')
+            DISABLE_CC=$(cfg_bool disable_core_ctl false)
+            do_lock
+            if cpu_online "$_c"; then
+                manual_del "$_c"
+                echo "FAIL"
+            else
+                echo "OK"
             fi
-            if cpu_online "$_c"; then echo "FAIL"; else echo "OK"; fi
         else
             echo "FAIL"
         fi
@@ -1440,18 +1628,19 @@ case "$1" in
         shift
         _c="$1"
         case "$_c" in ''|*[!0-9]*) echo "BADCPU"; exit 1;; esac
+        core_guard_enter || { echo "FAIL"; exit 1; }
         manual_del "$_c"
         # 立刻拉回来，不等下一轮循环（用户点了就该马上看到变化）
         if [ -f "/sys/devices/system/cpu/cpu$_c/online" ]; then
             [ "$_c" = "0" ] || echo 1 > "/sys/devices/system/cpu/cpu$_c/online" 2>/dev/null
         fi
         if cpu_online "$_c"; then echo "OK"; else echo "FAIL"; fi
+        core_guard_leave
         ;;
     --core-clear)
         # 「恢复全部核心」按钮：清空手动清单，再走一遍标准恢复。
         manual_clear
         unlock_once
-        echo "OK"
         ;;
     --core-list)
         # 只读：输出当前手动离线的核号，空格分隔，便于 App 与在线状态对照。
@@ -1464,6 +1653,7 @@ case "$1" in
         #
         # [applied] 本模块记录在案的冻结项：包名<TAB>方式
         # [actual]  系统当前真实的停用/挂起列表：包名<TAB>方式（含非本模块所为）
+        _status_actual=$(freeze_status_report)
         echo "[applied]"
         if [ -f "$FREEZE_STATE" ] && [ -s "$FREEZE_STATE" ]; then
             while IFS='	' read -r _p _st _md; do
@@ -1475,7 +1665,7 @@ case "$1" in
             # 记录文件不存在或为空（freeze_restore_all 结尾会 rm 掉它，模块升级也可能丢）：
             # 用「组开关为 on 且组内包在系统里确实被停用/挂起」反推，
             # 免得界面把已经冻上的包报成「没有冻结」。只补真实出现在 actual 里的包。
-            _fb_actual=$(freeze_status_report 2>/dev/null | cut -f1)
+            _fb_actual=$(printf '%s\n' "$_status_actual" | cut -f1)
             echo "$FREEZE_TABLE" | while IFS= read -r _fb_line; do
                 [ -z "$_fb_line" ] && continue
                 _fb_key=$(printf %s "$_fb_line" | cut -d"|" -f1)
@@ -1488,7 +1678,7 @@ case "$1" in
             done
         fi
         echo "[actual]"
-        freeze_status_report
+        printf '%s\n' "$_status_actual"
         echo "[groups]"
         # 各组开关当前值，供界面回显
         echo "$FREEZE_TABLE" | while IFS= read -r _line; do
@@ -1529,59 +1719,50 @@ case "$1" in
             true|false) ;;
             *) echo "SET_FREEZE_FAIL: 值须为 true 或 false"; exit 1 ;;
         esac
-        cfg_set_bool "freeze_$_k" "$_v" || { echo "SET_FREEZE_FAIL: 写配置失败"; exit 1; }
+        freeze_lock || { echo SET_FREEZE_BUSY; exit 1; }
+        cfg_set_bool "freeze_$_k" "$_v" || { freeze_unlock; echo "SET_FREEZE_FAIL: 写配置失败"; exit 1; }
         # 组被打开/关闭立刻同步一次，用户点完就能看到效果，不用等下个轮询周期
-        freeze_sync >/dev/null 2>&1
-        echo "SET_FREEZE_OK: $_k=$_v"
+        for _fm_member in $(freeze_group_pkgs "$_k"); do freeze_manual_del "$_fm_member"; done
+        _requested_group="$_k"; _requested_value="$_v"
+        freeze_sync_impl >/dev/null 2>&1
+        _group_result=$?
+        freeze_unlock
+        if [ "$_group_result" != 0 ]; then echo "SET_FREEZE_PARTIAL: $_requested_group=$_requested_value"; exit 1; fi
+        echo "SET_FREEZE_OK: $_requested_group=$_requested_value"
         exit 0
         ;;
-    --freeze-add)
-        # 单独冻结某个包（不依赖组开关），供界面里逐包勾选用
-        _p="$2"
-        if [ -z "$_p" ]; then echo "FREEZE_ADD_FAIL: 缺包名"; exit 1; fi
-        if freeze_off_pkg "$_p"; then
-            echo "FREEZE_ADD_OK: $_p"
-            exit 0
+    --freeze-add|--freeze-del)
+        _action="$1"; _requested_pkg="$2"
+        case "$_requested_pkg" in ''|*[!a-zA-Z0-9_.]*) echo FREEZE_FAIL; exit 1;; esac
+        # Only explicit table entries are accepted.
+        _known_pkgs=$(printf '%s\n' "$FREEZE_TABLE" | cut -d'|' -f3 | tr ' ' '\n')
+        printf '%s\n' "$_known_pkgs" | grep -qxF "$_requested_pkg" || { echo FREEZE_FAIL; exit 1; }
+        freeze_lock || { echo FREEZE_BUSY; exit 1; }
+        _action_ok=1
+        if [ "$_action" = --freeze-add ]; then
+            freeze_off_pkg "$_requested_pkg" && pkg_is_suspended "$_requested_pkg" &&
+                freeze_manual_set "$_requested_pkg" true && _action_ok=0
+            _action_mark=FREEZE_ADD
+        else
+            if freeze_on_pkg "$_requested_pkg"; then
+                freeze_manual_set "$_requested_pkg" false && _action_ok=0
+            fi
+            _action_mark=FREEZE_DEL
         fi
-        echo "FREEZE_ADD_FAIL: $_p"
-        exit 1
-        ;;
-    --freeze-del)
-        # 单独解冻某个包
-        #
-        # 【为什么要再回读一次真实状态】(v2.2.1)
-        #   旧实现是 freeze_on_pkg 失败后无脑补一次 unsuspend+enable，
-        #   然后不管结果如何都 echo FREEZE_DEL_OK。于是界面永远显示「已解冻」，
-        #   哪怕 pm 因为系统策略彻底拒绝执行 —— 这正是用户报的「点了没反应」。
-        #   现在：清掉孤儿挂起态之后必须回读 pkg_is_disabled，只有真的不再是
-        #   停用态才报 OK；仍是停用态就报 FAIL 并给出当前实测状态，让界面如实提示。
-        _p="$2"
-        if [ -z "$_p" ]; then echo "FREEZE_DEL_FAIL: 缺包名"; exit 1; fi
-        if freeze_on_pkg "$_p"; then
-            echo "FREEZE_DEL_OK: $_p"
-            exit 0
-        fi
-        # 没被记录过（或记录已清但系统仍挂起）→ 尝试清掉孤儿挂起态
-        pm unsuspend --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
-        pm enable --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
-        # 回读：只有确实不再是停用态才算成功
-        if ! pkg_is_disabled "$_p"; then
-            freeze_record_del "$_p"
-            echo "FREEZE_DEL_OK: $_p"
-            exit 0
-        fi
-        echo "FREEZE_DEL_FAIL: $_p (仍处于停用态)"
-        exit 1
+        freeze_unlock
+        if [ "$_action_ok" = 0 ]; then echo "${_action_mark}_OK: $_requested_pkg"; else echo "${_action_mark}_FAIL: $_requested_pkg"; fi
+        exit "$_action_ok"
         ;;
     --freeze-sync)
         # 按当前 config.json 立即同步一次组开关状态（不进入守护循环）
-        freeze_sync
+        freeze_sync || { echo "FREEZE_SYNC_FAIL"; exit 1; }
         echo "FREEZE_SYNC_DONE"
         exit 0
         ;;
     --freeze-restore)
         # 一键全部恢复：把本模块停用过的组件全部启用
-        freeze_restore_all
+        rm -f "$FREEZE_MANUAL"
+        freeze_restore_all || { echo "FREEZE_RESTORE_FAIL"; exit 1; }
         echo "FREEZE_RESTORE_DONE"
         exit 0
         ;;
