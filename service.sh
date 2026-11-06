@@ -125,7 +125,7 @@ cfg_int() {  # 数字
 # 被吞掉（实测踩过：\1 变成控制字符、\n 变成真换行）。awk 用 -v 传值，
 # 字符串里一个反斜杠都不用写，没有转义地狱。
 cfg_set_bool() {  # $1=键 $2=true|false
-    _k="$1"; _v="$2"
+    local _k="$1" _v="$2" _rc
     [ -f "$CONFIG_FILE" ] || return 1
 
     # 第一步：逐行扫描，命中就改值；全程没命中则 exit 7 表示需要追加
@@ -403,14 +403,73 @@ freeze_group_on() {
     [ "$(cfg_bool "freeze_$1" false)" = "true" ]
 }
 
+# Adapted from starlifezzz/Logd_Disabler_ColorOS16 service.sh.
+# Upstream: https://github.com/starlifezzz/Logd_Disabler_ColorOS16
+# Reuse authorized by the upstream author, as reported by the CoreGate maintainer.
+# CoreGate adaptations: lazy su probe, validated arguments, checked exit status,
+# exact package queries and existing restore journal; no legacy suspend migration,
+# upstream package stop and two-pass pkill cleanup retained.
+PMX_INITIALIZED=0
+PMX_USE_SU=0
+pmx_init() {
+    [ "$PMX_INITIALIZED" = 1 ] && return 0
+    PMX_INITIALIZED=1
+    if command -v su >/dev/null 2>&1 &&
+       su -c id 2>/dev/null | grep -q 'uid=0'; then
+        PMX_USE_SU=1
+    fi
+}
+pmx() {
+    local OLDIFS=$IFS rc
+    pmx_init
+    IFS=$(printf ' \t\n')
+    if [ "$PMX_USE_SU" = "1" ]; then
+        su -c "$*" 2>/dev/null
+    else
+        "$@" 2>/dev/null
+    fi
+    rc=$?
+    IFS=$OLDIFS
+    return "$rc"
+}
+
+pmx_verbose() {
+    local OLDIFS=$IFS rc
+    pmx_init
+    IFS=$(printf ' \t\n')
+    if [ "$PMX_USE_SU" = "1" ]; then
+        su -c "$*" 2>&1
+    else
+        "$@" 2>&1
+    fi
+    rc=$?
+    IFS=$OLDIFS
+    return "$rc"
+}
+
+freeze_pms_ready() {
+    pmx_init
+    pmx pm list packages --user "$FREEZE_USER" | grep -q '^package:'
+}
+freeze_wait_pms() {
+    local attempt=0
+    while [ "$attempt" -lt 120 ]; do
+        freeze_pms_ready && return 0
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    log "冻结：PackageManager 在 120 秒内未就绪，保留策略等待重试"
+    return 1
+}
+
 # 包是否真实存在于本机（避免对不存在的包反复 pm disable 刷日志）
 pkg_exists() {
-    pm list packages --user "$FREEZE_USER" 2>/dev/null | grep -qxF "package:$1"
+    pmx pm list packages --user "$FREEZE_USER" 2>/dev/null | grep -qxF "package:$1"
 }
 
 # 包当前是否已被停用（不管是本模块停的还是用户自己停的）
 pkg_is_disabled() {
-    pm list packages -d --user "$FREEZE_USER" 2>/dev/null | grep -qxF "package:$1"
+    pmx pm list packages -d --user "$FREEZE_USER" 2>/dev/null | grep -qxF "package:$1"
 }
 
 # ---------------- 停用记录 ----------------
@@ -440,9 +499,8 @@ freeze_record_del() {
     mv "$FREEZE_STATE.tmp" "$FREEZE_STATE" 2>/dev/null
 }
 
-# 记录/更新某包使用的冻结方式（第 3 列：suspend / disable）
-# 为什么单独一列：恢复时要知道该走 pm unsuspend 还是 pm enable，
-# 走错了会留下「包还挂起但记录已删」的孤儿状态。
+# 记录/更新某包使用的冻结方式（第 3 列统一写 disable）。
+# 新版使用停用/启用，不执行旧挂起状态迁移。
 freeze_record_set_mode() {  # $1=pkg $2=mode
     [ -f "$FREEZE_STATE" ] || return 0
     awk -F'\t' -v p="$1" -v m="$2" 'BEGIN{OFS="\t"}
@@ -452,93 +510,188 @@ freeze_record_set_mode() {  # $1=pkg $2=mode
     ' "$FREEZE_STATE" > "$FREEZE_STATE.tmp" 2>/dev/null && mv "$FREEZE_STATE.tmp" "$FREEZE_STATE" 2>/dev/null
 }
 
-# 强杀某包的进程（对齐 Logd_Disabler_ColorOS16 的 kill_pkg_procs）
+# 按包名停止进程（参考实现的 CoreGate 适配，避免命令行子串误杀）
 #
 # 【为什么不换 pgrep -U】
 #   参考模块 v2.3.1 的回滚注释记录得很清楚：pgrep -U 在 Android 上不安全，
 #   某些实现会返回全部 PID，配合 kill -9 会误杀 system_server 导致黑屏。
 #   所以这里只对明确包名执行 am force-stop。
 kill_pkg_procs() {
-    am force-stop --user "$FREEZE_USER" "$1" >/dev/null 2>&1
-    return 0
+    local pkg="$1"
+    local i
+    # 【v2.0.3】先 am force-stop（对 persistent 进程有效，会连同其所有服务/广播一起终止）
+    am force-stop "$pkg" 2>/dev/null
+    for i in 1 2; do
+        if pkill -f "$pkg" 2>/dev/null; then
+            log "  🔪 已终止残留进程: $pkg (第${i}次)"
+            sleep 2
+        else
+            [ "$i" = "1" ] && log "  📭 无残留进程: $pkg"
+            return 0
+        fi
+    done
+    log "  ⚠️ $pkg 持续存活（persistent），已尝试多轮强杀"
 }
 
 # 挂起状态须针对当前用户核实，不能把停用等同于冻结。
-pkg_is_suspended() {
-    local _suspend_dump
-    _suspend_dump=$(dumpsys package "$1" 2>/dev/null) || return 2
-    printf '%s
-' "$_suspend_dump" | awk -v u="User $FREEZE_USER:" '
-        index($0, u) { found=1; if ($0 ~ /suspended=true/) yes=1; exit }
-        END { if (!found) exit 2; exit !yes }'
-}
-freeze_record_mode() {
-    [ -f "$FREEZE_STATE" ] || return 0
-    awk -F'	' -v p="$1" '$1==p {print $3; exit}' "$FREEZE_STATE"
-}
 
-# 只挂起；设备拒绝挂起时明确报错，不改为停用应用。
-freeze_off_pkg() {
-    local _p="$1" _mode _susp_rc
-    pkg_exists "$_p" || return 1
-    if freeze_is_recorded "$_p"; then
-        case "$(freeze_orig_state "$_p")" in disabled|suspended) return 0;; esac
-        _mode=$(freeze_record_mode "$_p")
-        case "$_mode" in
-            suspend) pkg_is_suspended "$_p" && return 0 ;;
-            *)
-                # 将旧版由本模块造成的停用恢复，再迁移到挂起。
-                if pkg_is_disabled "$_p"; then
-                    pm enable --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
-                    pkg_is_disabled "$_p" && return 1
-                fi
-                ;;
-        esac
+
+
+# Upstream disable_pkg / enable_pkg with CoreGate state verification adapters.
+# Upstream ownership helpers adapted to CoreGate's tab-delimited journal.
+pkg_live_state() {
+    freeze_pms_ready || { echo unavailable; return 1; }
+    if ! pkg_exists "$1"; then echo missing
+    elif pkg_is_disabled "$1"; then echo disabled
+    else echo enabled; fi
+}
+record_orig() { freeze_record_add "$1" "$2"; }
+get_keep() { :; } # Single-package overrides are resolved by freeze_sync_impl.
+orig_state_of() {
+    if [ "${FREEZE_EXPLICIT:-false}" = true ]; then echo enabled
     else
-        if pkg_is_disabled "$_p"; then
-            freeze_record_add "$_p" disabled
-            return $?
-        fi
-        pkg_is_suspended "$_p"; _susp_rc=$?
-        if [ "$_susp_rc" = 0 ]; then
-            freeze_record_add "$_p" suspended
-            return $?
-        fi
-        [ "$_susp_rc" = 1 ] || return 1
-        # 先记恢复信息，即使进程中断仍能解除本模块挂起。
-        freeze_record_add "$_p" enabled || return 1
+        local original
+        original=$(freeze_orig_state "$1")
+        echo "$original"
     fi
-    freeze_record_set_mode "$_p" suspend || return 1
-    pm suspend --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
-    pkg_is_suspended "$_p" || return 1
-    kill_pkg_procs "$_p"
-    log "组件挂起：$_p"
-    return 0
 }
 
-# 根据记录恢复，失败时保留记录供重试。用户原有的停用/挂起保持原样。
+disable_pkg() {
+    local pkg="$1"
+    local keep_key="$2"
+    # 【v2.3.19-fix】归属判定：首次触碰先登记基线（模块安装前的真实状态）。
+    # 基线非 enabled（用户自己已禁用 / 已卸载 / 本机无此包）→ 本模块不接管，
+    # 既不 disable 也不在将来"恢复"它 —— 用户既存状态必须原样保留。
+    local _live _orig
+    _live=$(pkg_live_state "$pkg")
+    record_orig "$pkg" "$_live"
+    _orig=$(orig_state_of "$pkg")
+    if [ "$_orig" != "enabled" ]; then
+        log "  ⏭️ 非本模块改动（基线=$_orig），跳过: $pkg"
+        return 0
+    fi
+    # 【子包白名单】用户在 WebUI 单独启用（不禁用）的包
+    if [ -n "$keep_key" ]; then
+        local keep_val
+        keep_val=$(get_keep "$keep_key")
+        if [ -n "$keep_val" ]; then
+            local k
+            for k in $(echo "$keep_val" | tr ',' ' '); do
+                if [ "$k" = "$pkg" ]; then
+                    # 【修复】白名单包=用户在 WebUI 保留启用：
+                    # 不仅“跳过禁用”，还必须确保其处于启用态——
+                    # 若此前被 UI 总开关即时路径禁掉（pm disabled），
+                    # 此处重新 pm enable 拉回，保证重启后与配置一一对应。
+                    if pmx pm list packages -d --user 0 | grep -qF "package:$pkg"; then
+                        log "  🔄 白名单包被禁用，恢复启用: $pkg"
+                        result=$(pmx_verbose pm enable "$pkg")
+                        log "  $result"
+                    else
+                        log "  ⏭️ 跳过（WebUI 白名单保留）: $pkg"
+                    fi
+                    return 0
+                fi
+            done
+        fi
+    fi
+    # 检查包是否存在（对 user 0 可见；已禁用/卸载的也会被 pm list --user 0 过滤掉）
+    if ! pmx pm list packages --user 0 | grep -qF "$pkg"; then
+        log "  ⏭️ 跳过（不存在或已禁用/卸载）: $pkg"
+        return 0
+    fi
+    # 方法1：pm disable-user --user 0
+    result=$(pmx_verbose pm disable-user --user 0 "$pkg")
+    if echo "$result" | grep -qiE "new state: disabled|Success"; then
+        log "  ✅ disable-user 成功: $pkg"
+        kill_pkg_procs "$pkg"
+        return 0
+    fi
+    log "  ⚠️ disable-user 失败: $pkg ($result)"
+    # 【2026-10-02 事故】此处曾有"方法2：pm uninstall -k --user 0"fallback，
+    # 与手动卸载 thirdkit 致不开机的命令同族（见 coloros.md P0），已移除。
+    # 永不卸载：失败只允许继续"停用"，绝不做减法。
+    # 方法2：pm disable --user 0（全局禁用，persistent 应用专用兜底）
+    # 【v2.0.3】com.coloros.lockassistant 等 persistent 应用无法被 disable-user
+    # 禁用（系统立即重新拉起），改用全局 disable + 强杀进程组合。
+    result2=$(pmx_verbose pm disable --user 0 "$pkg" 2>&1)
+    if echo "$result2" | grep -qiE "new state: disabled|Success"; then
+        log "  ✅ pm disable 成功（persistent 兜底）: $pkg"
+        # persistent 应用禁用后系统会尝试重启，需多轮强杀
+        kill_pkg_procs "$pkg"
+        sleep 2
+        kill_pkg_procs "$pkg"
+        return 0
+    fi
+    log "  ❌ 两种方法均失败: $pkg ($result2)"
+    return 1
+}
+
+enable_pkg() {
+    local pkg="$1"
+    local orig
+    orig=$(orig_state_of "$pkg")
+    if [ -z "$orig" ]; then
+        # 无本模块改动记录（旧版升级且未走自举 / 从未触碰）→ 保持现状，不恢复
+        log "  ⏭️ 无本模块改动记录，保持现状不恢复: $pkg"
+        return 0
+    fi
+    if [ "$orig" != "enabled" ]; then
+        log "  ⏭️ 基线为 $orig（用户既存/本机无此包），不恢复: $pkg"
+        return 0
+    fi
+    local live
+    live=$(pkg_live_state "$pkg")
+    case "$live" in
+        enabled)
+            log "  ✅ 已启用（跳过）: $pkg"
+            return 0 ;;
+        missing)
+            # 基线本是 enabled，现被用户卸载 → 尊重用户操作，不复活
+            log "  ⏭️ 已被用户卸载，不复活: $pkg"
+            return 0 ;;
+    esac
+    # live=disabled 且基线=enabled → 本模块禁的，还原
+    local result
+    result=$(pmx_verbose pm enable --user 0 "$pkg")
+    if echo "$result" | grep -qiE "new state: enabled|Success"; then
+        log "  ✅ enable 成功: $pkg"
+        return 0
+    fi
+    log "  ⚠️ pm enable --user 0 失败: $pkg ($result)"
+    # persistent 类包：全局 enable 兜底（对应 disable_pkg 的 pm disable 兜底）
+    local result2
+    result2=$(pmx_verbose pm enable "$pkg" 2>&1)
+    if echo "$result2" | grep -qiE "new state: enabled|Success"; then
+        log "  ✅ pm enable 成功（persistent 恢复）: $pkg"
+        return 0
+    fi
+    log "  ❌ 两种恢复方法均失败: $pkg ($result2)"
+    return 1
+}
+
+# CoreGate command adapters. No suspend/unsuspend migration.
+freeze_off_pkg() {
+    local _p="$1" FREEZE_EXPLICIT=false _rc
+    freeze_pms_ready || return 1
+    pkg_exists "$_p" || return 1
+    record_orig "$_p" "$(pkg_live_state "$_p")" || return 1
+    freeze_record_set_mode "$_p" disable || return 1
+    disable_pkg "$_p"; _rc=$?
+    [ "$_rc" = 0 ] && pkg_is_disabled "$_p"
+}
 freeze_on_pkg() {
-    local _p="$1" _mode _orig _susp_rc
-    freeze_is_recorded "$_p" || return 0
-    _orig=$(freeze_orig_state "$_p")
-    case "$_orig" in
-        disabled|suspended) freeze_record_del "$_p"; return $? ;;
-    esac
-    if ! pkg_exists "$_p"; then freeze_record_del "$_p"; return $?; fi
-    _mode=$(freeze_record_mode "$_p")
-    case "$_mode" in
-        suspend)
-            pm unsuspend --user "$FREEZE_USER" "$_p" >/dev/null 2>&1 || return 1
-            pkg_is_suspended "$_p"; _susp_rc=$?
-            [ "$_susp_rc" = 1 ] || return 1
-            ;;
-        *)
-            if pkg_is_disabled "$_p"; then
-                pm enable --user "$FREEZE_USER" "$_p" >/dev/null 2>&1
-                pkg_is_disabled "$_p" && return 1
-            fi
-            ;;
-    esac
+    local _p="$1" FREEZE_EXPLICIT="${2:-false}"
+    freeze_pms_ready || return 1
+    if [ "$FREEZE_EXPLICIT" != true ]; then
+        freeze_is_recorded "$_p" || return 0
+        if [ "$(freeze_orig_state "$_p")" = disabled ]; then
+            freeze_record_del "$_p"; return $?
+        fi
+    fi
+    pkg_exists "$_p" || return 1
+    enable_pkg "$_p" || return 1
+    freeze_pms_ready && pkg_exists "$_p" || return 1
+    pkg_is_disabled "$_p" && return 1
     freeze_record_del "$_p"
 }
 
@@ -617,10 +770,18 @@ freeze_manual_del() {
 # 测试却全绿 —— 这是最危险的一类虚假通过。改引擎或改测试后，
 # 必须确认「开组后包状态真的变成 disabled」这条断言存在且为 PASS。
 freeze_sync_impl() {
-    _fs_packages=$(printf '%s\n' "$FREEZE_TABLE" | cut -d'|' -f3 | tr ' ' '\n' | sort -u)
+    # Do not silently succeed while PackageManager is unavailable at boot.
+    freeze_pms_ready || return 1
+    _fs_packages=$({ printf '%s\n' "$FREEZE_TABLE" | cut -d'|' -f3 | tr ' ' '\n';
+        [ ! -f "$FREEZE_STATE" ] || cut -f1 "$FREEZE_STATE";
+    } | sort -u)
     _fs_fail=0
     for _fs_pkg in $_fs_packages; do
-        pkg_exists "$_fs_pkg" || continue
+        if ! pkg_exists "$_fs_pkg"; then
+            # Retain owned records and surface incomplete recovery instead of false success.
+            freeze_is_recorded "$_fs_pkg" && _fs_fail=1
+            continue
+        fi
         _fs_want=$(freeze_manual_get "$_fs_pkg")
         if [ -z "$_fs_want" ]; then
             _fs_want=false
@@ -628,8 +789,12 @@ freeze_sync_impl() {
         fi
         if [ "$_fs_want" = true ]; then
             freeze_off_pkg "$_fs_pkg" || _fs_fail=1
-        elif freeze_is_recorded "$_fs_pkg"; then
-            freeze_on_pkg "$_fs_pkg" || _fs_fail=1
+        elif freeze_is_recorded "$_fs_pkg" || [ "$(freeze_manual_get "$_fs_pkg")" = false ]; then
+            if [ "$(freeze_manual_get "$_fs_pkg")" = false ]; then
+                freeze_on_pkg "$_fs_pkg" true || _fs_fail=1
+            else
+                freeze_on_pkg "$_fs_pkg" || _fs_fail=1
+            fi
         fi
     done
     return "$_fs_fail"
@@ -645,8 +810,7 @@ freeze_sync() {
 
 # 全部恢复（服务退出 / 卸载 / 一键全恢复时调用）
 # 严格按原始状态还原，原本 disabled 的保持 disabled
-freeze_restore_all() {
-    freeze_lock || return 1
+freeze_restore_all_impl() {
     local _restore_fail=0
     if [ -f "$FREEZE_STATE" ]; then
         _restore_pkgs=$(cut -f1 "$FREEZE_STATE")
@@ -654,8 +818,29 @@ freeze_restore_all() {
             freeze_on_pkg "$_restore_pkg" || _restore_fail=1
         done
     fi
-    freeze_unlock
     return "$_restore_fail"
+}
+freeze_restore_all() {
+    freeze_lock || return 1
+    freeze_restore_all_impl
+    local _restore_rc=$?
+    freeze_unlock
+    return "$_restore_rc"
+}
+freeze_clear_policy_and_restore() {
+    freeze_lock || return 1
+    local _clear_key _clear_rc=0
+    for _clear_key in $(printf '%s\n' "$FREEZE_TABLE" | cut -d'|' -f1); do
+        cfg_set_bool "freeze_$_clear_key" false || _clear_rc=1
+    done
+    if [ "$_clear_rc" = 0 ]; then
+        rm -f "$FREEZE_MANUAL" || _clear_rc=1
+    fi
+    if [ "$_clear_rc" = 0 ]; then
+        freeze_restore_all_impl || _clear_rc=1
+    fi
+    freeze_unlock
+    return "$_clear_rc"
 }
 
 # 状态查询：输出当前实际被停用/挂起的包（不管是否本模块所为），供状态面板展示
@@ -680,10 +865,10 @@ freeze_restore_all() {
 #   停用状态仍用 pm list packages -d（这个参数语义正确，实测可靠）。
 freeze_status_report() {
     # 1) 停用列表：pm list packages -d 语义正确，直接采信
-    pm list packages -d --user "$FREEZE_USER" 2>/dev/null | sed 's/^package://' | sed 's/$/\tdisabled/'
+    pmx pm list packages -d --user "$FREEZE_USER" 2>/dev/null | sed 's/^package://' | sed 's/$/\tdisabled/'
     # 2) 挂起列表：从 dumpsys package 里按包名上下文找 suspended=true
     #    只认 user 0（FREEZE_USER 默认 0），与冻结时保持同一用户口径
-    dumpsys package --all-components packages 2>/dev/null | awk -v u="User $FREEZE_USER:" '
+    pmx dumpsys package --all-components packages 2>/dev/null | awk -v u="User $FREEZE_USER:" '
         /^[[:space:]]*Package \[/ {
             # 形如 "  Package [com.foo.bar] (abc123):"
             pkg = $0
@@ -1240,6 +1425,7 @@ trap cleanup_on_exit TERM INT EXIT
 run() {
     # 进入守护主循环：此后退出（TERM/INT/EXIT）才需要全量还原，武装 trap。
     TRAP_ARMED=1
+    freeze_wait_pms
     echo $$ > "$PID_FILE" 2>/dev/null
     rm -f "$CONFIG_DIR/high_cores"
     state=""; pkg=""; want_lock=""; last_pkg=""; lock_logged=0; ss=""; it2=0; last_ss=""
@@ -1376,13 +1562,14 @@ run() {
 
         thermal_update
 
-        # ---- 可选组件停用：必须放在主开关判断之前 ----
-        # 原因：用户把模块主开关关掉、或进入安全模式时，下面会 continue 直接跳过本轮，
-        # 而「组件停用」属于必须随主开关一起失效的功能，所以恢复动作要在这里先做。
-        # 幂等：状态已同步时每轮只读文件、不真正调用 pm，开销可忽略。
+        # Freezing is independent of the CPU switch. Safety mode still restores it.
+        if [ "$SAFE_MODE" = "1" ]; then
+            freeze_restore_all
+        else
+            freeze_sync
+        fi
         if [ "$ENABLED" != "true" ] || [ "$SAFE_MODE" = "1" ]; then
             thermal_publish
-            freeze_restore_all
         fi
 
         # ---- 主开关 / 安全模式：关闭则全部恢复 ----
@@ -1487,8 +1674,6 @@ run() {
                 echo "$state|$pkg" > "$STATE_FILE"
             fi
         fi
-
-        freeze_sync
 
         # ---- 间隔：完全由用户配置的 poll_interval 决定，不再有任何硬编码覆盖 ----
         # 只有"刚退出游戏 / 刚进入游戏"的过渡轮用 5 秒短间隔，让锁核状态尽快对齐；
@@ -1724,8 +1909,17 @@ case "$1" in
         # 组被打开/关闭立刻同步一次，用户点完就能看到效果，不用等下个轮询周期
         for _fm_member in $(freeze_group_pkgs "$_k"); do freeze_manual_del "$_fm_member"; done
         _requested_group="$_k"; _requested_value="$_v"
-        freeze_sync_impl >/dev/null 2>&1
-        _group_result=$?
+        _group_result=0
+        for _group_pkg in $(freeze_group_pkgs "$_requested_group"); do
+            pkg_exists "$_group_pkg" || continue
+            if [ "$_requested_value" = true ] ||
+               [ -n "$(freeze_pkg_used_by_other "$_group_pkg" "$_requested_group")" ]; then
+                freeze_off_pkg "$_group_pkg" || _group_result=1
+            else
+                freeze_manual_set "$_group_pkg" false || _group_result=1
+                freeze_on_pkg "$_group_pkg" true || _group_result=1
+            fi
+        done
         freeze_unlock
         if [ "$_group_result" != 0 ]; then echo "SET_FREEZE_PARTIAL: $_requested_group=$_requested_value"; exit 1; fi
         echo "SET_FREEZE_OK: $_requested_group=$_requested_value"
@@ -1740,12 +1934,13 @@ case "$1" in
         freeze_lock || { echo FREEZE_BUSY; exit 1; }
         _action_ok=1
         if [ "$_action" = --freeze-add ]; then
-            freeze_off_pkg "$_requested_pkg" && pkg_is_suspended "$_requested_pkg" &&
-                freeze_manual_set "$_requested_pkg" true && _action_ok=0
+            # Persist intent first so a transient failure is retried by the daemon.
+            freeze_manual_set "$_requested_pkg" true &&
+                freeze_off_pkg "$_requested_pkg" && pkg_is_disabled "$_requested_pkg" && _action_ok=0
             _action_mark=FREEZE_ADD
         else
-            if freeze_on_pkg "$_requested_pkg"; then
-                freeze_manual_set "$_requested_pkg" false && _action_ok=0
+            if freeze_manual_set "$_requested_pkg" false; then
+                freeze_on_pkg "$_requested_pkg" true && _action_ok=0
             fi
             _action_mark=FREEZE_DEL
         fi
@@ -1761,8 +1956,7 @@ case "$1" in
         ;;
     --freeze-restore)
         # 一键全部恢复：把本模块停用过的组件全部启用
-        rm -f "$FREEZE_MANUAL"
-        freeze_restore_all || { echo "FREEZE_RESTORE_FAIL"; exit 1; }
+        freeze_clear_policy_and_restore || { echo "FREEZE_RESTORE_FAIL"; exit 1; }
         echo "FREEZE_RESTORE_DONE"
         exit 0
         ;;

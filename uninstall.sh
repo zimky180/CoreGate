@@ -71,7 +71,14 @@ ui_print "- 恢复被停用的系统组件..."
 # 若不在这之前把组件逐个 enable 回来，用户卸载模块后这些系统组件会永久处于停用状态，
 # 造成「卸载了但功能再也回不来」的严重残留 —— 必须放在删除数据之前。
 FREEZE_STATE="$CONFIG_DIR/freeze.state"
-if [ -f "$FREEZE_STATE" ]; then
+# Use the same upstream-derived transport, fallbacks and legacy migration as App commands.
+if [ -f "$MODDIR/service.sh" ] && [ -f "$FREEZE_STATE" ]; then
+    if ! sh "$MODDIR/service.sh" --freeze-restore; then
+        ui_print "  · 组件恢复未完成，保留数据，请在 App 中重试解冻"
+        exit 1
+    fi
+fi
+if [ -s "$FREEZE_STATE" ]; then
     # 记录格式：每行「包名<TAB>原始状态」
     # 只恢复原始态为 enabled 的（那才是本模块改过的）；
     # 原始态为 disabled 的是用户自己停用的，卸载时保持原样，不擅自打开。
