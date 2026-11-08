@@ -48,6 +48,10 @@ set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$MODPATH/service.sh" 0 0 0755
 set_perm "$MODPATH/uninstall.sh" 0 0 0755
 set_perm "$MODPATH/action.sh" 0 0 0755
+# Rust observer is bundled for manual read-only diagnostics.
+if [ -f "$MODPATH/bin/coregated" ]; then
+    set_perm "$MODPATH/bin/coregated" 0 0 0755
+fi
 
 # 数据目录放模块外：升级模块不覆盖配置
 CONFIG_DIR="/data/adb/CoreGate"
