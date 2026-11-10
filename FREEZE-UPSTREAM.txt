@@ -1,0 +1,9 @@
+CoreGate 冻结实现来源说明
+来源：https://github.com/starlifezzz/Logd_Disabler_ColorOS16
+来源文件：service.sh
+根据维护者说明，已取得原作者同意。
+kill_pkg_procs、disable_pkg、enable_pkg 三个函数与本地上游快照逐字节一致。
+保留原作者注释；pmx 额外保留命令退出码并延迟探测 su。
+外层适配 CoreGate 命令返回格式、单包优先策略及恢复记录。
+不再执行旧 suspend/unsuspend 迁移；已有系统挂起状态不会由本版本自动解除。
+只修改模块，不修改 APP。不代表已通过真机验证。

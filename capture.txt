@@ -1,0 +1,14 @@
+# CoreGate 录屏 / 相机包名列表
+# ----------------------------------------------------------------
+# 每行一个包名。当这些应用出现在前台时，模块会自动恢复全部核心，
+# 保证录屏编码与相机成片有足够算力，避免掉帧 / 卡顿。
+# 以 # 开头的行是注释；此文件升级模块时不会被覆盖，可放心自定义。
+# ----------------------------------------------------------------
+com.oplus.screenrecorder
+com.coloros.screenrecorder
+com.oneplus.screenrecord
+com.android.systemui.screenrecord
+com.oplus.camera
+com.oneplus.camera
+com.coloros.camera
+com.android.camera
