@@ -10,7 +10,7 @@
 # 即使卸载脚本不执行（如手动删目录），重启后 sysfs 也会自动恢复
 # ================================================================
 MODDIR=${0%/*}
-CONFIG_DIR="/data/adb/CoreGate"
+CONFIG_DIR="$MODDIR/data"
 PID_FILE="$CONFIG_DIR/daemon.pid"
 CORE_CTL_BACKUP="$CONFIG_DIR/corectl.state"
 

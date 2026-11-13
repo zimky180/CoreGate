@@ -16,13 +16,12 @@ lock_once() {
     # 一次性封锁：加载当前配置 → 封锁 → 视限频开关决定是否限频 → 退出
     # 注意：不写 PID、不进循环、不装 trap（避免退出时把用户刚锁好的核又全部解开）
     ENABLED=$(cfg_bool enabled true)
-    if [ -n "$1" ]; then
-        case "$1" in
-            *[!0-9]*) : ;;
-            *) AUTO_COUNT="$1"; [ "$AUTO_COUNT" -lt 1 ] && AUTO_COUNT=1;
-               [ "$AUTO_COUNT" -gt 4 ] && AUTO_COUNT=4 ;;
-        esac
-    fi
+    # 在 detect_high 前确定数量，确保临时参数也能扩大自动候选名单。
+    case "$1" in
+        ''|*[!0-9]*) : ;;
+        *) AUTO_COUNT="$1"; [ "$AUTO_COUNT" -lt 1 ] && AUTO_COUNT=1;
+           [ "$AUTO_COUNT" -gt 4 ] && AUTO_COUNT=4 ;;
+    esac
     LOCK_LIST=$(cfg_val lock_cores auto)
     if [ "$LOCK_LIST" = "auto" ]; then
         LOCK_LIST=$(detect_high)
@@ -34,9 +33,7 @@ lock_once() {
         case "$1" in
             ''|*[!0-9]*) : ;;   # 非数字忽略
             *)
-                n="$1"
-                [ "$n" -lt 1 ] && n=1
-                [ "$n" -gt 4 ] && n=4
+                n="$AUTO_COUNT"
                 # 取名单里靠后的 n 个核心（detect_high 默认把最高频核放最后）
                 LOCK_LIST=$(echo "$LOCK_LIST" | tr ' ' '\n' | grep -E '^[0-9]+$' | grep -v '^0$' | sort -nr | head -n "$n" | tr '\n' ' ')
                 ;;
@@ -55,6 +52,9 @@ lock_once() {
     fi
 
     do_lock
+    # ==== v2.5.6：用户主动封锁 = 撤销「手动恢复意图」 ====
+    # 不清标记的话，固态模式下主循环会一直认为「用户要核心在线」，永不重锁。
+    rm -f "$UNLOCK_HOLD" 2>/dev/null
     if [ "$LIMIT_FREQ" = "true" ]; then
         apply_freq_cap
     else
@@ -68,6 +68,12 @@ lock_once() {
 unlock_once() {
     # 一次性恢复：清除手动封锁意图，解锁全部核心并撤销限频。
     manual_clear
+    # ==== v2.5.6：落「手动恢复意图」标记 ====
+    # 一次性命令是独立进程，写不进守护进程内存里的 state，
+    # 主循环下一轮会照旧 do_lock，用户看到「恢复了又立刻变回去」。
+    # 落时间戳标记后：enabled=true 时主循环宽限 HOLD_GRACE 秒不锁核，
+    # enabled=false（固态模式）时永久尊重，直到用户再次手动封锁。
+    date +%s > "$UNLOCK_HOLD" 2>/dev/null
     LOCK_LIST=$(cfg_val lock_cores auto)
     if [ "$LOCK_LIST" = "auto" ]; then
         LOCK_LIST=$(detect_high)
@@ -97,12 +103,16 @@ case "$1" in
     --core-off)
         # App 点单个核心 = 要求它一直保持离线。
         # 只写清单 + 立刻下一次线，剩下的交给主循环维持：
-        # V2.4.1：日常模式维持手动清单；游戏 / 录屏 / 相机场景下
-        # 该核会被放开——游戏期间只认 game_lock_cores 名单，退出游戏后按回。
+        # 日常模式维持手动清单；启用游戏保持锁核时合并游戏策略名单。
+        # 退出游戏由日常模式接管；录屏与相机恢复按场景策略执行。
         shift
         _c="$1"
         case "$_c" in ''|*[!0-9]*) echo "BADCPU"; exit 1;; esac
+        core_guard_enter || { echo "FAIL"; exit 1; }
         if manual_add "$_c"; then
+            # ==== v2.5.6：手动下核 = 撤销「手动恢复意图」 ====
+            # 否则固态模式下主循环会一直跳过 do_lock，用户点的核下一轮就被拉回来。
+            rm -f "$UNLOCK_HOLD" 2>/dev/null
             AUTO_COUNT=$(cfg_int auto_lock_count 1)
             LOCK_LIST=$(cfg_val lock_cores auto)
             if [ "$LOCK_LIST" = auto ]; then LOCK_LIST=$(detect_high); fi
@@ -118,6 +128,7 @@ case "$1" in
         else
             echo "FAIL"
         fi
+        core_guard_leave
         ;;
     --core-on)
         # App 点同一个核心 = 撤销手动离线，交回自动策略。
@@ -263,6 +274,38 @@ case "$1" in
         # 按当前 config.json 立即同步一次组开关状态（不进入守护循环）
         freeze_sync || { echo "FREEZE_SYNC_FAIL"; exit 1; }
         echo "FREEZE_SYNC_DONE"
+        exit 0
+        ;;
+    --daemon-revive)
+        echo "CORE_GATE_STOPPED: restart device to resume"
+        exit 1
+        ;;
+    --stop)
+        _stop_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+        [ -n "$_stop_boot" ] || { echo STOP_FAIL; exit 1; }
+        # Persist before signalling so no concurrent launch can undo this stop.
+        printf '%s\n' "$_stop_boot" > "$CONFIG_DIR/stopped.boot" || exit 1
+        cfg_set_bool enabled false || { echo STOP_FAIL; exit 1; }
+        _stop_pid=$(cat "$PID_FILE" 2>/dev/null)
+        case "$_stop_pid" in ''|*[!0-9]*|0|1) ;; *)
+            _stop_cmd=$(tr '\000' ' ' < "/proc/$_stop_pid/cmdline" 2>/dev/null)
+            case "$_stop_cmd" in *"$MODDIR/CoreGate.sh"*|*"$MODDIR/service.sh"*)
+                if [ "$_stop_pid" != "$$" ] && kill -0 "$_stop_pid" 2>/dev/null; then
+                    kill -TERM "$_stop_pid" 2>/dev/null || { echo STOP_FAIL; exit 1; }
+                    _stop_wait=0
+                    while kill -0 "$_stop_pid" 2>/dev/null && [ "$_stop_wait" -lt 10 ]; do
+                        sleep 1
+                        _stop_wait=$((_stop_wait + 1))
+                    done
+                    kill -0 "$_stop_pid" 2>/dev/null && { echo STOP_FAIL; exit 1; }
+                fi
+                ;; *) echo STOP_PID_MISMATCH; exit 1;; esac
+            ;;
+        esac
+        rm -f "$PID_FILE"
+        cfg_set_bool daemon_alive false || { echo STOP_FAIL; exit 1; }
+        echo "dead" > "$STATE_FILE"
+        echo STOP_OK
         exit 0
         ;;
     --freeze-restore)

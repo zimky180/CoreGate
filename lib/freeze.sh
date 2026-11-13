@@ -132,6 +132,10 @@ pmx_verbose() {
 }
 
 freeze_pms_ready() {
+    # A sync owns one validated snapshot; disabled-state checks remain live.
+    if [ "${_FS_PKGS_ACTIVE:-0}" = 1 ] && [ "$_FS_PKGS_USER" = "$FREEZE_USER" ]; then
+        return 0
+    fi
     pmx_init
     pmx pm list packages --user "$FREEZE_USER" | grep -q '^package:'
 }
@@ -148,6 +152,12 @@ freeze_wait_pms() {
 
 # 包是否真实存在于本机（避免对不存在的包反复 pm disable 刷日志）
 pkg_exists() {
+    if [ "${_FS_PKGS_ACTIVE:-0}" = 1 ] && [ "$_FS_PKGS_USER" = "$FREEZE_USER" ]; then
+        case "$_FS_NL$_FS_ALL_PACKAGES$_FS_NL" in
+            *"$_FS_NL""package:$1""$_FS_NL"*) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
     pmx pm list packages --user "$FREEZE_USER" 2>/dev/null | grep -qxF "package:$1"
 }
 
@@ -202,11 +212,14 @@ freeze_record_set_mode() {  # $1=pkg $2=mode
 #   所以这里只对明确包名执行 am force-stop。
 kill_pkg_procs() {
     local pkg="$1"
-    local i
+    local i pattern
+    case "$pkg" in ''|*[!a-zA-Z0-9_.]*) return 1;; esac
+    pattern=$(printf '%s' "$pkg" | sed 's/\./[.]/g')
+    pattern="^${pattern}(:[^[:space:]]+)?([[:space:]]|$)"
     # 【v2.0.3】先 am force-stop（对 persistent 进程有效，会连同其所有服务/广播一起终止）
     am force-stop "$pkg" 2>/dev/null
     for i in 1 2; do
-        if pkill -f "$pkg" 2>/dev/null; then
+        if pkill -f "$pattern" 2>/dev/null; then
             log "  🔪 已终止残留进程: $pkg (第${i}次)"
             sleep 2
         else
@@ -279,7 +292,7 @@ disable_pkg() {
         fi
     fi
     # 检查包是否存在（对 user 0 可见；已禁用/卸载的也会被 pm list --user 0 过滤掉）
-    if ! pmx pm list packages --user 0 | grep -qF "$pkg"; then
+    if ! pkg_exists "$pkg"; then
         log "  ⏭️ 跳过（不存在或已禁用/卸载）: $pkg"
         return 0
     fi
@@ -454,8 +467,20 @@ freeze_manual_del() {
 # 测试却全绿 —— 这是最危险的一类虚假通过。改引擎或改测试后，
 # 必须确认「开组后包状态真的变成 disabled」这条断言存在且为 PASS。
 freeze_sync_impl() {
-    # Do not silently succeed while PackageManager is unavailable at boot.
-    freeze_pms_ready || return 1
+    # Local scope also covers nested adapters and command substitutions.
+    # A failed/empty query is an error, never permission to discard journals.
+    local _FS_PKGS_ACTIVE=0 _FS_PKGS_USER="$FREEZE_USER"
+    local _FS_ALL_PACKAGES _FS_NL _fs_line _fs_ready=0
+    _FS_ALL_PACKAGES=$(pmx pm list packages --user "$FREEZE_USER") || return 1
+    _FS_NL='
+'
+    while IFS= read -r _fs_line; do
+        case "$_fs_line" in package:?*) _fs_ready=1; break;; esac
+    done <<EOF
+$_FS_ALL_PACKAGES
+EOF
+    [ "$_fs_ready" = 1 ] || return 1
+    _FS_PKGS_ACTIVE=1
     _fs_packages=$({ printf '%s\n' "$FREEZE_TABLE" | cut -d'|' -f3 | tr ' ' '\n';
         [ ! -f "$FREEZE_STATE" ] || cut -f1 "$FREEZE_STATE";
     } | sort -u)
@@ -484,8 +509,25 @@ freeze_sync_impl() {
     return "$_fs_fail"
 }
 
+# Any journal or explicit choice must still be reconciled, even with all groups off.
+freeze_has_work() {
+    [ -s "$FREEZE_STATE" ] && return 0
+    [ -s "$FREEZE_MANUAL" ] && return 0
+    local _fw_key _fw_label _fw_packages
+    while IFS='|' read -r _fw_key _fw_label _fw_packages; do
+        [ -n "$_fw_key" ] || continue
+        freeze_group_on "$_fw_key" && return 0
+    done <<EOF
+$FREEZE_TABLE
+EOF
+    return 1
+}
 freeze_sync() {
     freeze_lock || return 1
+    if ! freeze_has_work; then
+        freeze_unlock
+        return 0
+    fi
     freeze_sync_impl
     _fs_result=$?
     freeze_unlock
@@ -575,5 +617,3 @@ freeze_status_report() {
         }
     '
 }
-
-

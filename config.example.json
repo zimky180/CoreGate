@@ -28,5 +28,7 @@
   "cap_gpu_pwrlevel": -1,
   "temperature_lock_cores": "",
   "game_lock_enable": false,
-  "game_lock_cores": ""
+  "game_lock_cores": "",
+  "policy_master_enabled": false,
+  "fg_only_detect": true
 }

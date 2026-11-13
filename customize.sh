@@ -8,40 +8,19 @@ ui_print "=============================="
 ui_print "  CoreGate 核心门控 安装中"
 ui_print "=============================="
 
-# ---------- 安装前清理旧版本残留 ----------
-# 目的：不论从哪个旧版本升级/重装，都先彻底清掉历史残留，避免版本间状态错乱。
-# 注意：只清【运行时残留/旧日志/旧临时文件】，绝不删除用户配置（config.json / packages.txt），
-#       保证「完全可逆 + 升级不丢配置」的模块哲学不被破坏。
-ui_print "- 清理旧版本残留..."
-
-# 1) 旧的运行配置目录（历史版本曾把日志/状态留在此处；新版只保留 config.json 与 packages.txt）
-if [ -d "/data/adb/CoreGate" ]; then
-    # 先停掉可能仍在运行、且指向旧路径的守护进程
-    if [ -f "/data/adb/CoreGate/daemon.pid" ]; then
-        oldpid=$(cat "/data/adb/CoreGate/daemon.pid" 2>/dev/null)
-        case "$oldpid" in
-            ''|*[!0-9]*) : ;;
-            *) kill "$oldpid" 2>/dev/null; sleep 1 ;;
-        esac
-    fi
-    # 清掉旧日志与旧状态，保留用户配置
-    rm -f "/data/adb/CoreGate/coregate.log" \
-          "/data/adb/CoreGate/coregate.log.tmp" \
-          "/data/adb/CoreGate/service.log" \
-          "/data/adb/CoreGate/state" \
-          "/data/adb/CoreGate/daemon.pid" \
-          "/data/adb/CoreGate/crash_flag" \
-          "/data/adb/CoreGate/corectl.state" 2>/dev/null
-    rm -f /data/adb/CoreGate/giveup_* 2>/dev/null
-    rm -rf "/data/adb/CoreGate/log" 2>/dev/null
-fi
-
-# 2) 模块本体目录内可能的旧日志残留（同一次升级时 MODPATH 已就位）
-rm -f "$MODPATH/coregate.log" "$MODPATH/coregate.log.tmp" 2>/dev/null
-rm -rf "$MODPATH/log" 2>/dev/null
+# Stop old daemons before copying persistent recovery records.
+for _cg_dir in /data/adb/CoreGate /data/adb/modules/CoreGate/data "$MODPATH/data"; do
+    [ -f "$_cg_dir/daemon.pid" ] || continue
+    oldpid=$(cat "$_cg_dir/daemon.pid" 2>/dev/null)
+    case "$oldpid" in ''|*[!0-9]*) : ;; *) kill "$oldpid" 2>/dev/null; sleep 1 ;; esac
+done
 
 ui_print "- 解压模块文件..."
-unzip -o "$ZIPFILE" -x 'META-INF/*' -d "$MODPATH" >&2
+unzip -o "$ZIPFILE" -x 'META-INF/*' -d "$MODPATH" >&2 || abort "! 模块解压失败，安装已中止"
+for _cg_required in CoreGate.sh service.sh config.example.json migrate-config.sh lib/config.sh lib/hardware.sh lib/freeze.sh lib/cores.sh lib/frequency.sh lib/probe.sh lib/runtime.sh lib/thermal.sh lib/lifecycle.sh lib/commands.sh; do
+    [ -s "$MODPATH/$_cg_required" ] || abort "! 模块文件缺失或为空：$_cg_required"
+done
+unset _cg_required
 
 ui_print "- 设置脚本权限..."
 set_perm_recursive "$MODPATH" 0 0 0755 0644
@@ -53,10 +32,34 @@ if [ -f "$MODPATH/bin/coregated" ]; then
     set_perm "$MODPATH/bin/coregated" 0 0 0755
 fi
 
-# 数据目录放模块外：升级模块不覆盖配置
-CONFIG_DIR="/data/adb/CoreGate"
-mkdir -p "$CONFIG_DIR"
+# Persistent data lives inside the module and must survive staged upgrades.
+CONFIG_DIR="$MODPATH/data"
+mkdir -p "$CONFIG_DIR" || abort "! 无法创建模块数据目录"
 chmod 0755 "$CONFIG_DIR"
+cg_copy_asset() {
+    _cg_src="$1"; _cg_dst="$2"
+    [ -f "$_cg_src" ] || return 0
+    [ "$_cg_src" = "$_cg_dst" ] && return 0
+    if [ -f "$_cg_dst" ] && ! cmp -s "$_cg_src" "$_cg_dst"; then
+        # Never silently overwrite conflicting recovery records.
+        abort "! 数据冲突：$_cg_dst；保留旧目录，请先核对"
+        return 1
+    fi
+    cp -p "$_cg_src" "$_cg_dst" || { abort "! 迁移失败，保留旧目录"; return 1; }
+    cmp -s "$_cg_src" "$_cg_dst" || { abort "! 迁移校验失败，保留旧目录"; return 1; }
+}
+# Copy installed module data first (MODPATH may be modules_update/CoreGate).
+for _cg_from in /data/adb/modules/CoreGate/data /data/adb/CoreGate; do
+    [ "$_cg_from" = "$CONFIG_DIR" ] && continue
+    for _cg_asset in config.json packages.txt capture.txt freq_snapshot freeze.state corectl.state factory_snapshot; do
+        cg_copy_asset "$_cg_from/$_cg_asset" "$CONFIG_DIR/$_cg_asset" || abort "! 资产迁移失败"
+    done
+done
+# Only persistent assets are copied; stale runtime files must not survive.
+rm -f "$CONFIG_DIR/daemon.pid" "$CONFIG_DIR/state" "$CONFIG_DIR/crash_flag"
+# Every listed asset has been copied and verified before removing legacy data.
+[ ! -d /data/adb/CoreGate ] || rm -rf /data/adb/CoreGate
+
 if [ ! -f "$CONFIG_DIR/config.json" ]; then
     ui_print "- 首次安装：写入默认配置..."
     cp -f "$MODPATH/config.example.json" "$CONFIG_DIR/config.json"
@@ -76,6 +79,9 @@ if [ ! -f "$CONFIG_DIR/packages.txt" ]; then
     fi
     chmod 0644 "$CONFIG_DIR/packages.txt"
 fi
+
+# Remove the resident game assistant from upgraded lists too.
+sed -i '/^[[:space:]]*com\.oplus\.games[[:space:]]*$/d' "$CONFIG_DIR/packages.txt"
 
 # 录屏 / 相机包名列表（独立纯文本，每行一个包名，升级不覆盖）
 if [ ! -f "$CONFIG_DIR/capture.txt" ]; then

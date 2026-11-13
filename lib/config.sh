@@ -1,10 +1,61 @@
-# ---------------- 配置读取（config.json 每字段一行） ----------------
+# One scalar snapshot per loop; never eval configuration as shell code.
+_CG_CACHE_READY=0
+_CG_CACHE_DIRTY=1
+cfg_reload() {
+    local _cg_new
+    _cg_new=$(awk '
+        {
+            rest=$0
+            while (match(rest, /"[A-Za-z_][A-Za-z0-9_]*"[[:space:]]*:/)) {
+                key=substr(rest,RSTART,RLENGTH)
+                sub(/^"/,"",key); sub(/"[[:space:]]*:$/,"",key)
+                rest=substr(rest,RSTART+RLENGTH)
+                sub(/^[[:space:]]*/,"",rest)
+                if (match(rest, /^"([^"\\]|\\.)*"/)) {
+                    value=substr(rest,2,RLENGTH-2); type="s"
+                } else if (match(rest, /^(true|false)([[:space:],}]|$)/)) {
+                    value=substr(rest,1,RLENGTH)
+                    sub(/[[:space:],}].*/,"",value); type="b"
+                } else if (match(rest, /^-?[0-9]+([[:space:],}]|$)/)) {
+                    value=substr(rest,1,RLENGTH)
+                    sub(/[[:space:],}].*/,"",value); type="i"
+                } else continue
+                rest=substr(rest,RLENGTH+1)
+                id=type SUBSEP key
+                if (!seen[id]++) print type "|" key "|" value
+            }
+        }
+    ' "$CONFIG_FILE" 2>/dev/null) || { _CG_CACHE_READY=0; return 1; }
+    _CG_SCALARS=$_cg_new
+    _CG_CACHE_READY=1
+    _CG_CACHE_DIRTY=0
+}
+cfg_cached() {
+    local _cg_type _cg_key _cg_value
+    while IFS='|' read -r _cg_type _cg_key _cg_value; do
+        if [ "$_cg_type" = "$1" ] && [ "$_cg_key" = "$2" ]; then
+            if [ -n "$_cg_value" ]; then printf '%s\n' "$_cg_value"
+            else printf '%s\n' "$3"; fi
+            return 0
+        fi
+    done <<EOF
+$_CG_SCALARS
+EOF
+    printf '%s\n' "$3"
+}
+# ---------------- 配置读取（config.json 单行或多行） ----------------
 cfg_val() {  # 字符串
+    if [ "${_CG_CACHE_READY:-0}" = 1 ] && [ "${_CG_CACHE_DIRTY:-1}" = 0 ]; then
+        cfg_cached s "$1" "$2"; return
+    fi
     k="$1"; d="$2"
     v=$(sed -n "s/.*\"$k\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$CONFIG_FILE" 2>/dev/null | head -1)
     [ -n "$v" ] && echo "$v" || echo "$d"
 }
 cfg_bool() {  # 布尔
+    if [ "${_CG_CACHE_READY:-0}" = 1 ] && [ "${_CG_CACHE_DIRTY:-1}" = 0 ]; then
+        cfg_cached b "$1" "$2"; return
+    fi
     k="$1"; d="$2"
     # 注意：必须用扩展正则(-E)，BusyBox 的 BRE 模式不支持 \(a\|b\) 交替语法，
     # 用 BRE 会解析为空导致所有布尔项回退默认值（真机 v1.36.1 实测确认）。
@@ -12,6 +63,9 @@ cfg_bool() {  # 布尔
     [ -n "$v" ] && echo "$v" || echo "$d"
 }
 cfg_int() {  # 数字
+    if [ "${_CG_CACHE_READY:-0}" = 1 ] && [ "${_CG_CACHE_DIRTY:-1}" = 0 ]; then
+        cfg_cached i "$1" "$2"; return
+    fi
     k="$1"; d="$2"
     v=$(sed -nE "s/.*\"$k\"[[:space:]]*:[[:space:]]*(-?[0-9]+)[[:space:]]*([,}].*)?$/\1/p" "$CONFIG_FILE" 2>/dev/null | head -1)
     [ -n "$v" ] && echo "$v" || echo "$d"
@@ -25,6 +79,7 @@ cfg_int() {  # 数字
 # 被吞掉（实测踩过：\1 变成控制字符、\n 变成真换行）。awk 用 -v 传值，
 # 字符串里一个反斜杠都不用写，没有转义地狱。
 cfg_set_bool() {  # $1=键 $2=true|false
+    _CG_CACHE_DIRTY=1
     local _k="$1" _v="$2" _rc
     [ -f "$CONFIG_FILE" ] || return 1
 

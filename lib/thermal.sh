@@ -19,10 +19,17 @@ thermal_read() {
     }'
 }
 thermal_publish() {
+    local _tp_key
+    _tp_key="$_thermal_status|$THERMAL_TEMP|$THERMAL_MODE|$THERMAL_THRESHOLD|$THERMAL_EXTRA_CONFIG|$THERMAL_EXTRA_ACTIVE|$THERMAL_ENABLED|$ENABLED|$SAFE_MODE"
+    # Disabled state has no sensor heartbeat. Republish on any change or missing file.
+    if [ "$_thermal_status" = disabled ] && [ "${_THERMAL_PUBLISHED_KEY:-}" = "$_tp_key" ] && [ -s "$THERMAL_STATE_FILE" ]; then
+        return 0
+    fi
     # 九段协议保持不变，第 9 段（cpu_temp）恒为空串：CPU 温度已移除，
     # 保留空位是为了不破坏 APK 侧按 | 切分的兼容性。
     printf '%s|%s|%s|%s|%s|battery|%s|%s|%s\n' "$_thermal_status" "$THERMAL_TEMP" "$THERMAL_MODE" "$THERMAL_THRESHOLD" "$(date +%s)" "$THERMAL_EXTRA_CONFIG" "$THERMAL_EXTRA_ACTIVE" "" > "$THERMAL_STATE_FILE.$$.tmp" &&
-        mv -f "$THERMAL_STATE_FILE.$$.tmp" "$THERMAL_STATE_FILE"
+        mv -f "$THERMAL_STATE_FILE.$$.tmp" "$THERMAL_STATE_FILE" &&
+        _THERMAL_PUBLISHED_KEY=$_tp_key
 }
 
 
@@ -57,7 +64,10 @@ thermal_decide() {
 }
 
 thermal_update() {
-    THERMAL_ENABLED=$(cfg_bool temperature_enabled false)
+    THERMAL_ENABLED=false
+    if [ "${POLICY_MASTER:-false}" = true ] && [ "$ENABLED" = true ] && [ "$SAFE_MODE" != 1 ]; then
+        THERMAL_ENABLED=$(cfg_bool temperature_enabled false)
+    fi
     # 温度策略未开启时立即短路：不读传感器、不读额外名单、不做比较，
     # 只发布一次合法状态串。这是模块最主要的空闲路径，
     # 必须保证 sh 进程本身几乎零开销（省电模块不能自己耗电）。
@@ -74,6 +84,7 @@ thermal_update() {
         THERMAL_EXTRA_ACTIVE=""
         THERMAL_TEMP=""
         THERMAL_HOT=0
+        THERMAL_KEY=""
         _thermal_status=disabled
         thermal_publish
         return 0

@@ -38,11 +38,11 @@ if [ -z "$TARGET" ]; then
     echo "请到项目发布页下载 CoreGate-*.apk 安装后，再点一次「执行」。"
     echo ""
     echo "提示：不装 App 也能正常锁核，"
-    echo "      模块会一直使用 /data/adb/CoreGate/config.json 里的配置运行。"
+    echo "      模块会一直使用 /data/adb/modules/CoreGate/data/config.json 里的配置运行。"
     echo ""
     echo "--- 当前模块运行状态（只读）---"
-    if [ -f "/data/adb/CoreGate/daemon.pid" ]; then
-        _p=$(cat "/data/adb/CoreGate/daemon.pid" 2>/dev/null)
+    if [ -f "/data/adb/modules/CoreGate/data/daemon.pid" ]; then
+        _p=$(cat "/data/adb/modules/CoreGate/data/daemon.pid" 2>/dev/null)
         if [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null; then
             echo "守护进程：运行中 (PID $_p)"
         else
@@ -51,8 +51,8 @@ if [ -z "$TARGET" ]; then
     else
         echo "守护进程：未运行"
     fi
-    if [ -f "/data/adb/CoreGate/state" ]; then
-        echo "上次状态：$(cat /data/adb/CoreGate/state 2>/dev/null)"
+    if [ -f "/data/adb/modules/CoreGate/data/state" ]; then
+        echo "上次状态：$(cat /data/adb/modules/CoreGate/data/state 2>/dev/null)"
     fi
     exit 0
 fi

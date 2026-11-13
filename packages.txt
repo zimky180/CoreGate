@@ -5,7 +5,6 @@ com.netease.my
 com.tencent.jkccz
 com.hermes.xinlong
 com.HoYoverse.na
-com.oplus.games
 com.tencent.tmgp.sgame
 com.tencent.jkchess
 com.tencent.tmgp.pubgmhd
