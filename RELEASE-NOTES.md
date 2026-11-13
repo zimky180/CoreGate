@@ -28,13 +28,6 @@
 - 更新悬浮卡片、音乐面板、主题设置、触摸反馈及贡献者资料；完整提交界面资源、音频资源、第三方许可与构建配置。
 - App 更新检查的正式仓库为 zimky180/CoreGate-App；CoreGate-APK 作为同步源码和 CI 构建入口。
 
-## 下载与签名
-
-- **CoreGate-v2.6.4.zip**：可刷入的模块包。
-- **CoreGate-v2.6.4-debug.apk**：CI debug 签名的可安装 APK。遇到签名不一致无法覆盖时，请先确认现装 APK 来源；卸载 App 会清除 App 本地设置。
-- **CoreGate-v2.6.4-release-unsigned.apk**：未签名的 release 构建，仅供自行签名，不能直接作为普通安装包安装。
-- **SHA256SUMS.txt**：发布附件校验值。GitHub 自动附带的 Source code 为对应 tag 的完整源码。
-
 ## 验证与已知边界
 
 - v2.6.4 GitHub Actions 构建成功，debug/release 构建与模块打包通过；本地既有回归报告为 75 项、0 失败。
