@@ -62,6 +62,15 @@ cap_cluster() {
     # 不超过该簇硬件上限
     _hw=$(cat "$_dir/cpuinfo_max_freq" 2>/dev/null)
     if [ -n "$_hw" ] && [ "$_want" -gt "$_hw" ]; then _want="$_hw"; fi
+    # Resolve the alignment allowance to a real OPP, so readback does not
+    # trigger another write on every poll (e.g. 1651800 -> 1651200).
+    _available=$(cat "$_dir/scaling_available_frequencies" 2>/dev/null)
+    _aligned=0
+    for _opp in $_available; do
+        case "$_opp" in ''|*[!0-9]*) continue ;; esac
+        if [ "$_opp" -le "$_want" ] && [ "$_opp" -gt "$_aligned" ]; then _aligned=$_opp; fi
+    done
+    [ "$_aligned" -gt 0 ] && _want=$_aligned
     freq_write_if_needed "$_dir/scaling_max_freq" "$_want"
 }
 # ---------------- 限频前状态快照（第2条需求：关闭限频必须还原到开启前的真实状态） ----------------
@@ -126,18 +135,31 @@ restore_cluster() {
 }
 
 # GPU(kgsl) 节点强化写入：系统会周期性重设 max_gpuclk / max_pwrlevel，
-# 单写一次会被立刻改回，故需 chmod 644 解锁 → 连写 4 次 → sync → chmod 444 锁定。
+# 偏离目标才 chmod 644 解锁 → 连写 4 次 → chmod 444 锁定；sysfs 不需要全盘 sync。
 # 恢复时由 gpu_restore_write 先 chmod 644 解锁再写回原值，保证可逆。
 gpu_force_write() {
     _node="$1"; _val="$2"
     [ -e "$_node" ] || return 1
+    _actual=$(cat "$_node" 2>/dev/null)
+    case "$_actual" in
+        ''|*[!0-9]*) ;;
+        *)
+            case "$_node" in
+                */max_pwrlevel) [ "$_actual" = "$_val" ] && return 0 ;;
+                *)
+                    # kgsl rounds away the +800000 Hz alignment allowance.
+                    if [ "$_actual" -gt 0 ] && [ "$_actual" -le "$_val" ] &&
+                       [ "$(( _val - _actual ))" -le 800000 ]; then return 0; fi
+                    ;;
+            esac
+            ;;
+    esac
+    chmod 644 "$_node" 2>/dev/null
     i=0
     while [ "$i" -lt 4 ]; do
-        chmod 644 "$_node" 2>/dev/null
         echo "$_val" > "$_node" 2>/dev/null
         i=$(( i + 1 ))
     done
-    sync 2>/dev/null
     chmod 444 "$_node" 2>/dev/null
 }
 # 恢复专用：先 chmod 644 解开锁定，再写回原值（不重新锁定）

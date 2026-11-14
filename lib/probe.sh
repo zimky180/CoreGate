@@ -148,24 +148,25 @@ fg_pkgs_fg_only() {
 #   逐 /proc 目录 for + cat       4500 ms           —— 绝对不能这么写（每进程 fork 数次）
 # 关键：必须写成「单次 cat 通配 + 管道过滤」，绝不能循环 fork。
 # cmdline 用 \0 分隔参数，tr 转成换行后每行一个参数，用 grep -x 精确匹配包名。
-bg_pkgs() {
-    # V2.5.4 需求 1：只扫游戏名单，相机/录屏名单不再参与全进程扫描。
-    # 原因：相机、录屏应用退出界面后进程常常仍驻留后台，若参与全进程扫描，
-    #       会导致「后台挂着相机 → 核心永远不解封」，与省电目标相反。
-    #       现在录屏/相机只认前台窗口（见 fg_pkgs_fg_only + is_capture）。
-    _bp_list="$GAME_LIST"
-    # 名单为空：直接 return，连构造 pattern 的管道都不跑（省 ~13 ms 纯 fork 开销）。
-    # 这是最常见的情况（用户没配游戏名单），必须走这条零成本路径。
-    [ -z "$_bp_list" ] && return 0
-    # 短名单转成 grep -x -E 的 | 分隔形式。
-    _bp_pat=$(printf '%s\n' "$_bp_list" | grep -v '^#' | grep -v '^$' \
-        | sed 's/[].[*^$()+?{}|\\]/\\&/g' | tr '\n' '|' | sed 's/|$//')
-    [ -z "$_bp_pat" ] && return 0
-    cat /proc/[0-9]*/cmdline 2>/dev/null \
-        | tr '\0' '\n' \
-        | grep -x -E "$_bp_pat" \
-        | sort -u
+installed_running_pkgs() {
+    # Installed system and user apps only; process arguments are not package identities.
+    _cg_user=$(am get-current-user 2>/dev/null)
+    case "$_cg_user" in ''|*[!0-9]*) _cg_user=0;; esac
+    _cg_installed=$(pm list packages --user "$_cg_user" 2>/dev/null | sed -n 's/^package://p')
+    [ -n "$_cg_installed" ] || return 0
+    awk -v installed="$_cg_installed" 'BEGIN { n=split(installed,a,"\n"); for(i=1;i<=n;i++) ok[a[i]]=1 } ok[$0] && !seen[$0]++' | sort -u
 }
+bg_pkgs() {
+    cat /proc/[0-9]*/cmdline 2>/dev/null | tr '\000' '\n' | sed -nE 's/^([a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+)(:[a-zA-Z0-9_.-]+)?$/\1/p' | installed_running_pkgs
+}
+scan_publish() {
+    _scan_mode=foreground
+    [ "$(cfg_bool fg_only_detect true)" = true ] || _scan_mode=all
+    _scan_packages=$(printf '%s\n' "$PKGS" | sed '/^$/d' | installed_running_pkgs | tr '\n' ',')
+    printf '%s|%s|%s|%s|%s\n' "$_scan_mode" "$(date +%s)" "$$" "${1:-active}" "$_scan_packages" > "$CONFIG_DIR/scan.state.$$.tmp"
+    mv -f "$CONFIG_DIR/scan.state.$$.tmp" "$CONFIG_DIR/scan.state"
+}
+
 is_game() {  # $1=多行候选包名，任一精确命中即游戏
     while IFS= read -r pkg; do
         [ -z "$pkg" ] && continue
@@ -219,7 +220,8 @@ is_charging() {
 # Call directly in the parent shell so even an empty result is cached this round.
 fg_refresh() {
     [ "${_FG_ROUND_READY:-0}" = 1 ] && return 0
-    PKGS=$(fg_pkgs)
+    PKGS=$(fg_pkgs | sort -u)
+    scan_publish active
     _FG_ROUND_READY=1
 }
 

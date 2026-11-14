@@ -1,10 +1,10 @@
 # CoreGate · 核心门控模块
 
-**v2.6.4 / 264** · 作者 zimky
+**v2.7.1 / 271** · 作者 zimky
 
 日常锁核与限频，游戏自动恢复；支持冻结管理、电池温度策略与游戏保持锁核。模块独立运行，App 用于配置和查看状态。
 
-- [模块下载](https://github.com/zimky180/CoreGate/releases/tag/v2.6.4)
+- [模块下载](https://github.com/zimky180/CoreGate/releases/tag/v2.7.1)
 - [配套原生 App 与完整工程](https://github.com/zimky180/CoreGate-App)
 - [累计更新说明](RELEASE-NOTES.md)
 
@@ -26,15 +26,15 @@
 
 运行时修改 sysfs，不写系统分区。禁用/卸载并重启可撤销运行时修改。
 
-## 本次修复
+## 本次更新（相对 v2.6.4）
 
-- 修复限频配置解析与缓存，避免读取错误后静默回退默认值。
-- 修复游戏保持锁核目标名单切换、核心恢复顺序与操作失败反馈。
-- 检测范围切换改为可滑动悬浮胶囊。
-- 贡献者资料更正为 Dere3046（酷安 UID 37601237）。
-- 生命周期标记清理、崩溃自愈与 SAFE_MODE；限频实现沿用 v2.4.2 原版。
+- CPU 限频目标对齐实际档位，避免因读回差异每轮重复写入。
+- GPU 已达目标时跳过强化写入，移除 sysfs 写入后的全盘 sync。
+- 发布实际包名轮询与息屏状态记录，支持配套 App 扫描详情。
+- 补充 HyperOS、MagicOS、OriginOS 录屏与相机包名，升级仅追加缺失项。
+- 配套 App 新增进程管理、扫描详情，优化主题、文字与音乐动效。
 
-完整累计更新请见 [v2.6.4 Release](https://github.com/zimky180/CoreGate-App/releases/tag/v2.6.4) 与 [RELEASE-NOTES.md](RELEASE-NOTES.md)。
+完整累计更新请见 [v2.7.1 Release](https://github.com/zimky180/CoreGate-App/releases/tag/v2.7.1) 与 [RELEASE-NOTES.md](RELEASE-NOTES.md)。
 
 ## 完整源码与打包
 
@@ -50,4 +50,4 @@ python3 tools/package_module.py --source . --output out
 
 项目许可见 [LICENSE](LICENSE)，冻结相关上游说明见 [FREEZE-UPSTREAM.txt](FREEZE-UPSTREAM.txt)。App 完整第三方声明见 [CoreGate-App](https://github.com/zimky180/CoreGate-App)。感谢 App 内列出的全部 13 位贡献者。
 
-更新日期：2026-11-13。
+更新日期：2026-11-14。

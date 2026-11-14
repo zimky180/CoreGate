@@ -62,7 +62,11 @@ com.android.systemui.screenrecord
 com.oplus.camera
 com.oneplus.camera
 com.coloros.camera
-com.android.camera"
+com.android.camera
+com.miui.screenrecorder
+com.hihonor.camera
+com.hihonor.screenrecorder
+com.vivo.smartshot"
 
 mkdir -p "$LOG_DIR" 2>/dev/null
 

@@ -1,7 +1,7 @@
 id=CoreGate
 name=核心门控 2.0（大核封锁·游戏自动恢复）
-version=v2.6.4
-versionCode=264
+version=v2.7.1
+versionCode=271
 author=zimky
 description=日常锁核与限频，游戏自动恢复，支持冻结管理、温度策略与游戏保持锁核。热插拔自动恢复。
 updateJson=https://raw.githubusercontent.com/zimky180/CoreGate/main/update.json

@@ -2,7 +2,7 @@
 # ----------------------------------------------------------------
 # 每行一个包名。当这些应用出现在前台时，模块会自动恢复全部核心，
 # 保证录屏编码与相机成片有足够算力，避免掉帧 / 卡顿。
-# 以 # 开头的行是注释；此文件升级模块时不会被覆盖，可放心自定义。
+# 以 # 开头的行是注释；升级保留自定义内容，并补齐新增厂商的默认包名。
 # ----------------------------------------------------------------
 com.oplus.screenrecorder
 com.coloros.screenrecorder
@@ -12,3 +12,8 @@ com.oplus.camera
 com.oneplus.camera
 com.coloros.camera
 com.android.camera
+# realme UI 复用上方 OPlus / ColorOS 包名；以下为 HyperOS、MagicOS、OriginOS。
+com.miui.screenrecorder
+com.hihonor.camera
+com.hihonor.screenrecorder
+com.vivo.smartshot

@@ -90,6 +90,16 @@ if [ ! -f "$CONFIG_DIR/capture.txt" ]; then
     chmod 0644 "$CONFIG_DIR/capture.txt"
 fi
 
+# 补齐新增厂商策略包名；只追加缺失项，保留自定义内容与原有顺序。
+for capture_pkg in com.miui.screenrecorder com.hihonor.camera com.hihonor.screenrecorder com.vivo.smartshot; do
+    if ! grep -qxF "$capture_pkg" "$CONFIG_DIR/capture.txt" 2>/dev/null; then
+        printf '
+%s
+' "$capture_pkg" >> "$CONFIG_DIR/capture.txt"
+    fi
+done
+chmod 0644 "$CONFIG_DIR/capture.txt"
+
 # 升级时按当前字段模板迁移；保留有效设置，不在开机时重置配置。
 if [ -f "$MODPATH/migrate-config.sh" ]; then
     . "$MODPATH/migrate-config.sh"

@@ -429,6 +429,7 @@ run() {
         # ---- 前台应用：仅亮屏时检测；息屏直接锁定（息屏无游戏可点，完全省电不检测） ----
         if [ "$ss" = "OFF" ]; then
             PKGS=""
+            scan_publish screen_off
         else
             fg_refresh
         fi
